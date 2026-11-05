@@ -1,0 +1,24 @@
+# Modified in lakemeter-sqlite, a fork of databrickslabs/lakemeter-oss: deploys the SQLite backend (DB_BACKEND=sqlite) with a UC volume for snapshots; upstream's Lakebase version is in FORK_CHANGES.md.
+# Lakemeter on SQLite for workspaces with no Lakebase and no internet.
+# App resource required: a UC volume, key "snapshot-volume", permission "Can read and write".
+command:
+  - "/bin/bash"
+  - "-c"
+  - "PYTHONPATH=. uvicorn app.main:app --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000}"
+
+env:
+  - name: "ENVIRONMENT"
+    value: "production"
+  - name: "CORS_ORIGINS"
+    value: ""
+  - name: "DB_BACKEND"
+    value: "sqlite"
+  # Working copy; the Apps filesystem is wiped on restart, the snapshot is not.
+  - name: "SQLITE_PATH"
+    value: "/tmp/lakemeter/lakemeter.db"
+  # Durable copy of estimates: the volume root; lakemeter-data.db is written inside it.
+  - name: "LAKEMETER_SNAPSHOT_PATH"
+    valueFrom: "snapshot-volume"
+  # auto: the AI assistant appears only if the serving endpoint exists (none air-gapped).
+  - name: "LAKEMETER_AI_ASSISTANT"
+    value: "auto"

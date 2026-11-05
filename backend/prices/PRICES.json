@@ -1,0 +1,36 @@
+{
+  "as_of": "2026-11-05",
+  "fetched_at": "2026-11-05T03:55:11Z",
+  "currency": "USD",
+  "source": "Azure Retail Prices API (prices.azure.com), public list prices",
+  "regions": {
+    "australiaeast": {
+      "dbu_prices": 25,
+      "vm_prices": 1098,
+      "vm_instance_types": 305,
+      "not_in_retail_api": [],
+      "overrides": [
+        "DATABASE_SERVERLESS_COMPUTE=0.63 (Databricks list price (system.billing.list_prices, PREMIUM_DATABASE_SERVERLESS_COMPUTE_AUSTRALIA_EAST, 0.63 since 2025-06-11); the Azure Retail meter still shows 0.32)",
+        "ALL_PURPOSE_COMPUTE_(DLT)=0.55 (No Azure Retail meter; billed as All-purpose Compute (same price), as in the upstream snapshot)",
+        "OPENAI_MODEL_SERVING=0.07 (No Azure Retail meter; upstream snapshot value (2026-04-10))",
+        "ANTHROPIC_MODEL_SERVING=0.105 (No Azure Retail meter; upstream snapshot value (2026-04-10))",
+        "GEMINI_MODEL_SERVING=0.07 (No Azure Retail meter; upstream snapshot value (2026-04-10))"
+      ]
+    },
+    "australiasoutheast": {
+      "dbu_prices": 24,
+      "vm_prices": 1022,
+      "vm_instance_types": 279,
+      "not_in_retail_api": [
+        "SERVERLESS_REAL_TIME_INFERENCE_LAUNCH"
+      ],
+      "overrides": [
+        "DATABASE_SERVERLESS_COMPUTE=0.68 (Not in the Databricks list for this region; upstream snapshot value (2026-04-10); the Azure Retail meter shows 0.32)",
+        "ALL_PURPOSE_COMPUTE_(DLT)=0.55 (No Azure Retail meter; billed as All-purpose Compute (same price), as in the upstream snapshot)",
+        "OPENAI_MODEL_SERVING=0.07 (No Azure Retail meter; upstream snapshot value (2026-04-10))",
+        "ANTHROPIC_MODEL_SERVING=0.105 (No Azure Retail meter; upstream snapshot value (2026-04-10))",
+        "GEMINI_MODEL_SERVING=0.07 (No Azure Retail meter; upstream snapshot value (2026-04-10))"
+      ]
+    }
+  }
+}

@@ -1,0 +1,21 @@
+command:
+  - "/bin/bash"
+  - "-c"
+  - "PYTHONPATH=. uvicorn app.main:app --host 0.0.0.0 --port ${DATABRICKS_APP_PORT:-8000}"
+
+env:
+  - name: "ENVIRONMENT"
+    value: "production"
+
+  - name: "LAKEBASE_ENDPOINT"
+    valueFrom: "postgres"
+  - name: "LAKEMETER_DATABASE_AUTH_MODE"
+    value: "oauth_only"
+  - name: "LAKEMETER_BOOTSTRAP_DATABASE"
+    value: "true"
+
+  - name: "CLAUDE_MODEL_ENDPOINT"
+    valueFrom: "claude-endpoint"
+
+  - name: "CORS_ORIGINS"
+    value: ""

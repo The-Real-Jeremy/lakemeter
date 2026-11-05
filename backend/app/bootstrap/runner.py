@@ -1,0 +1,516 @@
+# Modified in lakemeter-sqlite, a fork of databrickslabs/lakemeter-oss: adds the SQLite bootstrap and loads backend/prices on top of the bundled snapshot. See FORK_CHANGES.md.
+"""Idempotent first-start bootstrap for Marketplace Lakebase bindings."""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+from pathlib import Path
+from typing import Any, Iterable
+
+from app.version import APP_VERSION
+
+
+logger = logging.getLogger(__name__)
+
+_LOCK_ID = 5494756857658233925
+_BOUNDARY = "-- LAKEMETER_STATEMENT_BOUNDARY"
+_BACKEND_DIR = Path(__file__).resolve().parents[2]
+_SQL_DIR = Path(__file__).resolve().parent / "sql"
+_PRICING_DIR = _BACKEND_DIR / "static" / "pricing"
+# Refreshed list prices that replace snapshot rows with the same key
+# (scripts/refresh_azure_prices.py). Committed with the app.
+_PRICE_OVERLAY_DIR = _BACKEND_DIR / "prices"
+_OVERLAY_TABLES = (
+    ("*-dbu-rates.csv", "sync_pricing_dbu_rates", ("cloud", "region", "tier", "sku_name")),
+    ("*-vm-costs.csv", "sync_pricing_vm_costs",
+     ("cloud", "region", "instance_type", "pricing_tier", "payment_option")),
+)
+
+_PRICING_LOADS = (
+    (
+        "dbu-rates.csv",
+        "sync_pricing_dbu_rates",
+        (
+            "sku_name", "cloud", "tier", "product_type", "sku_region",
+            "region", "usage_unit", "price_per_dbu", "currency_code",
+            "pricing_type", "fetched_at",
+        ),
+    ),
+    (
+        "instance-dbu-rates.csv",
+        "sync_ref_instance_dbu_rates",
+        (
+            "cloud", "instance_type", "vcpus", "memory_gb", "dbu_rate",
+            "instance_family", "is_active", "source",
+        ),
+    ),
+    (
+        "dbu-multipliers.csv",
+        "sync_ref_dbu_multipliers",
+        ("cloud", "sku_type", "feature", "multiplier", "category"),
+    ),
+    (
+        "dbsql-rates.csv",
+        "sync_product_dbsql_rates",
+        (
+            "cloud", "warehouse_type", "warehouse_size", "sku_product_type",
+            "dbu_per_hour", "includes_compute",
+        ),
+    ),
+    (
+        "dbsql-warehouse-config.csv",
+        "sync_ref_dbsql_warehouse_config",
+        (
+            "cloud", "warehouse_size", "worker_count",
+            "driver_instance_type", "worker_instance_type", "warehouse_type",
+        ),
+    ),
+    (
+        "serverless-rates.csv",
+        "sync_product_serverless_rates",
+        (
+            "cloud", "product", "size_or_model", "rate_type", "dbu_rate",
+            "input_divisor", "is_hourly", "sku_product_type", "description",
+        ),
+    ),
+    (
+        "fmapi-databricks-rates.csv",
+        "sync_product_fmapi_databricks",
+        (
+            "cloud", "model", "rate_type", "dbu_rate", "input_divisor",
+            "is_hourly", "sku_product_type",
+        ),
+    ),
+    (
+        "fmapi-proprietary-rates.csv",
+        "sync_product_fmapi_proprietary",
+        (
+            "provider", "model", "endpoint_type", "context_length",
+            "rate_type", "dbu_rate", "input_divisor", "is_hourly",
+            "sku_product_type", "cloud",
+        ),
+    ),
+    (
+        "vm-costs.csv",
+        "sync_pricing_vm_costs",
+        (
+            "cloud", "region", "instance_type", "pricing_tier",
+            "payment_option", "cost_per_hour", "currency", "source",
+            "fetched_at",
+        ),
+    ),
+    (
+        "sku-region-map.csv",
+        "sync_ref_sku_region_map",
+        ("cloud", "sku_region", "region_code"),
+    ),
+)
+
+
+def _sql_statements(filename: str) -> list[str]:
+    content = (_SQL_DIR / filename).read_text(encoding="utf-8")
+    return [
+        statement.strip()
+        for statement in content.split(_BOUNDARY)
+        if statement.strip()
+    ]
+
+
+def _pricing_paths(filename: str) -> list[Path]:
+    path = _PRICING_DIR / filename
+    if path.is_file():
+        return [path]
+
+    parts = sorted(_PRICING_DIR.glob(f"{path.stem}_part*.csv"))
+    if not parts:
+        raise RuntimeError(f"Required pricing file is missing: {path}")
+    return parts
+
+
+def _overlay_paths(pattern: str) -> list[Path]:
+    return sorted(_PRICE_OVERLAY_DIR.glob(pattern)) if _PRICE_OVERLAY_DIR.is_dir() else []
+
+
+def _pricing_checksum() -> str:
+    digest = hashlib.sha256()
+    paths = []
+    for filename, _, _ in _PRICING_LOADS:
+        digest.update(filename.encode("utf-8"))
+        paths += _pricing_paths(filename)
+    for pattern, _, _ in _OVERLAY_TABLES:
+        paths += _overlay_paths(pattern)
+    for path in paths:
+        digest.update(path.name.encode("utf-8"))
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _overlay_value(column: str, value: str):
+    if value == "":
+        return None
+    if column in ("price_per_dbu", "cost_per_hour"):
+        return float(value)
+    return value
+
+
+def _apply_price_overlay(cursor: Any) -> int:
+    """Replace snapshot price rows with the refreshed ones in backend/prices.
+
+    A row whose key matches is deleted and the refreshed row inserted; every
+    other snapshot row is kept. Runs identically on PostgreSQL and SQLite.
+    """
+    import csv
+
+    applied = 0
+    for pattern, table, key in _OVERLAY_TABLES:
+        for path in _overlay_paths(pattern):
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                columns = reader.fieldnames or []
+                rows = list(reader)
+            if not rows:
+                continue
+            for region in sorted({r["region"] for r in rows}):
+                region_rows = [r for r in rows if r["region"] == region]
+                keys = sorted({"|".join(r[k] for k in key[2:]) for r in region_rows})
+                placeholders = ", ".join(["%s"] * len(keys))
+                key_expr = " || '|' || ".join(f"COALESCE({k}, '')" for k in key[2:])
+                cursor.execute(
+                    f"DELETE FROM lakemeter.{table} WHERE UPPER(cloud) = %s AND region = %s "
+                    f"AND {key_expr} IN ({placeholders})",
+                    (region_rows[0]["cloud"].upper(), region, *keys),
+                )
+                cursor.executemany(
+                    f"INSERT INTO lakemeter.{table} ({', '.join(columns)}) "
+                    f"VALUES ({', '.join(['%s'] * len(columns))})",
+                    [tuple(_overlay_value(c, r[c]) for c in columns) for r in region_rows],
+                )
+                applied += len(region_rows)
+    return applied
+
+
+def _execute_statements(cursor: Any, statements: Iterable[str]) -> None:
+    for statement in statements:
+        cursor.execute(statement)
+
+
+def _seed_reference_data(cursor: Any) -> None:
+    import json
+
+    seed_path = Path(__file__).resolve().parent / "seeds.json"
+    seeds = json.loads(seed_path.read_text(encoding="utf-8"))
+
+    workload_sql = """
+        INSERT INTO lakemeter.ref_workload_types (
+            workload_type, display_name, description,
+            show_compute_config, show_serverless_toggle,
+            show_serverless_performance_mode, show_photon_toggle,
+            show_dlt_config, show_dbsql_config, show_serverless_product,
+            show_fmapi_config, show_lakebase_config, show_vector_search_mode,
+            show_vm_pricing, show_usage_hours, show_usage_runs,
+            show_usage_tokens, sku_product_type_standard,
+            sku_product_type_photon, sku_product_type_serverless, display_order
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        )
+        ON CONFLICT (workload_type) DO UPDATE SET
+            display_name = EXCLUDED.display_name,
+            description = EXCLUDED.description,
+            show_compute_config = EXCLUDED.show_compute_config,
+            show_serverless_toggle = EXCLUDED.show_serverless_toggle,
+            show_serverless_performance_mode =
+                EXCLUDED.show_serverless_performance_mode,
+            show_photon_toggle = EXCLUDED.show_photon_toggle,
+            show_dlt_config = EXCLUDED.show_dlt_config,
+            show_dbsql_config = EXCLUDED.show_dbsql_config,
+            show_serverless_product = EXCLUDED.show_serverless_product,
+            show_fmapi_config = EXCLUDED.show_fmapi_config,
+            show_lakebase_config = EXCLUDED.show_lakebase_config,
+            show_vector_search_mode = EXCLUDED.show_vector_search_mode,
+            show_vm_pricing = EXCLUDED.show_vm_pricing,
+            show_usage_hours = EXCLUDED.show_usage_hours,
+            show_usage_runs = EXCLUDED.show_usage_runs,
+            show_usage_tokens = EXCLUDED.show_usage_tokens,
+            sku_product_type_standard = EXCLUDED.sku_product_type_standard,
+            sku_product_type_photon = EXCLUDED.sku_product_type_photon,
+            sku_product_type_serverless = EXCLUDED.sku_product_type_serverless,
+            display_order = EXCLUDED.display_order
+    """
+    cursor.executemany(workload_sql, seeds["workload_types"])
+
+    cloud_sql = """
+        INSERT INTO lakemeter.ref_cloud_tiers (
+            cloud, tier, display_name, description, display_order, is_active
+        )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (cloud, tier) DO UPDATE SET
+            display_name = EXCLUDED.display_name,
+            description = EXCLUDED.description,
+            display_order = EXCLUDED.display_order,
+            is_active = EXCLUDED.is_active
+    """
+    cursor.executemany(cloud_sql, seeds["cloud_tiers"])
+
+
+def _copy_csv(cursor: Any, copy_sql: str, handle: Any) -> None:
+    """Stream a CSV into PostgreSQL using psycopg2 or psycopg3 COPY APIs."""
+    copy_expert = getattr(cursor, "copy_expert", None)
+    if callable(copy_expert):
+        copy_expert(copy_sql, handle)
+        return
+
+    copy = getattr(cursor, "copy", None)
+    if not callable(copy):
+        raise RuntimeError("Database cursor does not support COPY")
+
+    with copy(copy_sql) as copy_op:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            copy_op.write(chunk)
+
+
+def _load_pricing(cursor: Any) -> None:
+    for filename, table, columns in _PRICING_LOADS:
+        cursor.execute(f"TRUNCATE TABLE lakemeter.{table}")
+        column_list = ", ".join(columns)
+        copy_sql = (
+            f"COPY lakemeter.{table} ({column_list}) "
+            "FROM STDIN WITH (FORMAT CSV, HEADER TRUE)"
+        )
+        for path in _pricing_paths(filename):
+            with path.open(
+                "r",
+                encoding="utf-8",
+            ) as handle:
+                _copy_csv(cursor, copy_sql, handle)
+
+
+def _refresh_derived_reference_data(cursor: Any) -> None:
+    cursor.execute("TRUNCATE TABLE lakemeter.ref_model_serving_gpu_types")
+    cursor.execute("""
+        INSERT INTO lakemeter.ref_model_serving_gpu_types (
+            cloud, gpu_type, description, is_active
+        )
+        SELECT DISTINCT cloud, size_or_model, '', TRUE
+        FROM lakemeter.sync_product_serverless_rates
+        WHERE product = 'model_serving'
+          AND LOWER(size_or_model) LIKE '%gpu%'
+    """)
+
+    cursor.execute("TRUNCATE TABLE lakemeter.ref_fmapi_databricks_models")
+    cursor.execute("""
+        INSERT INTO lakemeter.ref_fmapi_databricks_models (
+            model_name, description, is_active
+        )
+        SELECT DISTINCT model, '', TRUE
+        FROM lakemeter.sync_product_fmapi_databricks
+    """)
+
+    cursor.execute("TRUNCATE TABLE lakemeter.ref_fmapi_proprietary_models")
+    cursor.execute("""
+        INSERT INTO lakemeter.ref_fmapi_proprietary_models (
+            provider, model_name, description, is_active
+        )
+        SELECT DISTINCT provider, model, '', TRUE
+        FROM lakemeter.sync_product_fmapi_proprietary
+    """)
+
+    cursor.execute("""
+        INSERT INTO lakemeter.sku_discount_mapping (
+            sku, sku_display_name, discount_category, workload_group,
+            description
+        )
+        SELECT DISTINCT
+            sku_name, sku_name, 'dbu', product_type, product_type
+        FROM lakemeter.sync_pricing_dbu_rates
+        WHERE sku_name IS NOT NULL AND sku_name != ''
+        ON CONFLICT (sku) DO UPDATE SET
+            sku_display_name = EXCLUDED.sku_display_name,
+            discount_category = EXCLUDED.discount_category,
+            workload_group = EXCLUDED.workload_group,
+            description = EXCLUDED.description
+    """)
+    for pattern in ("Model Serving%", "Model Training%", "%Proprietary%"):
+        cursor.execute(
+            """
+            UPDATE lakemeter.sku_discount_mapping
+            SET cross_service_eligible = FALSE
+            WHERE sku LIKE %s
+            """,
+            (pattern,),
+        )
+
+
+def _pricing_is_present(cursor: Any) -> bool:
+    cursor.execute("SELECT COUNT(*) FROM lakemeter.sync_pricing_dbu_rates")
+    dbu_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM lakemeter.sync_pricing_vm_costs")
+    vm_count = cursor.fetchone()[0]
+    return dbu_count > 0 and vm_count > 0
+
+
+def bootstrap_database(engine: Any | None = None) -> bool:
+    """Bring an already-bound Lakebase database to the packaged app version.
+
+    Returns ``True`` when bootstrap work was applied and ``False`` when the
+    database was already current.
+    """
+    if engine is None:
+        from app import database
+
+        if database.engine is None and not database.refresh_engine():
+            raise RuntimeError("Lakebase connection is unavailable for bootstrap")
+        engine = database.engine
+
+    if getattr(getattr(engine, "dialect", None), "name", None) == "sqlite":
+        return _bootstrap_sqlite(engine)
+
+    checksum = _pricing_checksum()
+    connection = engine.raw_connection()
+    cursor = connection.cursor()
+    locked = False
+    try:
+        cursor.execute("SELECT pg_advisory_lock(%s)", (_LOCK_ID,))
+        locked = True
+
+        _execute_statements(cursor, _sql_statements("schema.sql"))
+        cursor.execute("""
+            SELECT app_version, pricing_checksum
+            FROM lakemeter.app_bootstrap_state
+            WHERE singleton = TRUE
+        """)
+        current = cursor.fetchone()
+        version_changed = current is None or current[0] != APP_VERSION
+        pricing_changed = (
+            current is None
+            or current[1] != checksum
+            or not _pricing_is_present(cursor)
+        )
+
+        if not version_changed and not pricing_changed:
+            connection.commit()
+            logger.info("Lakebase bootstrap is already current")
+            return False
+
+        if version_changed:
+            _execute_statements(cursor, _sql_statements("functions.sql"))
+            _seed_reference_data(cursor)
+
+        if pricing_changed:
+            _load_pricing(cursor)
+            _apply_price_overlay(cursor)
+            _refresh_derived_reference_data(cursor)
+
+        cursor.execute(
+            """
+            INSERT INTO lakemeter.app_bootstrap_state (
+                singleton, app_version, pricing_checksum, bootstrapped_at
+            )
+            VALUES (TRUE, %s, %s, NOW())
+            ON CONFLICT (singleton) DO UPDATE SET
+                app_version = EXCLUDED.app_version,
+                pricing_checksum = EXCLUDED.pricing_checksum,
+                bootstrapped_at = EXCLUDED.bootstrapped_at
+            """,
+            (APP_VERSION, checksum),
+        )
+        connection.commit()
+        logger.info(
+            "Lakebase bootstrap completed for app version %s",
+            APP_VERSION,
+        )
+        return True
+    except Exception:
+        connection.rollback()
+        logger.exception("Lakebase bootstrap failed")
+        raise
+    finally:
+        if locked:
+            try:
+                cursor.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_ID,))
+                connection.commit()
+            except Exception:
+                logger.exception("Failed to release Lakebase bootstrap lock")
+        cursor.close()
+        connection.close()
+
+
+def _bootstrap_sqlite(engine: Any) -> bool:
+    """The same bootstrap on the SQLite backend (``DB_BACKEND=sqlite``).
+
+    Same schema, seeds, pricing files and derived reference data as the
+    PostgreSQL path above. There are no stored functions to load:
+    ``services/pricing_engine.py`` replaces ``functions.sql``. A single app
+    process owns the file, so ``BEGIN IMMEDIATE`` stands in for the advisory
+    lock.
+    """
+    from app.sqlite_backend import (
+        SqliteCursor, copy_csv, execute_schema, sqlite_schema_statements,
+    )
+
+    checksum = _pricing_checksum()
+    connection = engine.raw_connection()
+    raw_cursor = connection.cursor()
+    cursor = SqliteCursor(raw_cursor)
+    try:
+        raw_cursor.execute("BEGIN IMMEDIATE")
+        schema_sql = (_SQL_DIR / "schema.sql").read_text(encoding="utf-8")
+        execute_schema(raw_cursor, sqlite_schema_statements(schema_sql, _BOUNDARY))
+        cursor.execute("""
+            SELECT app_version, pricing_checksum
+            FROM lakemeter.app_bootstrap_state
+            WHERE singleton = TRUE
+        """)
+        current = cursor.fetchone()
+        version_changed = current is None or current[0] != APP_VERSION
+        pricing_changed = (
+            current is None
+            or current[1] != checksum
+            or not _pricing_is_present(cursor)
+        )
+        if not version_changed and not pricing_changed:
+            connection.commit()
+            logger.info("SQLite bootstrap is already current")
+            return False
+
+        if version_changed:
+            _seed_reference_data(cursor)
+
+        if pricing_changed:
+            for filename, table, columns in _PRICING_LOADS:
+                cursor.execute(f"TRUNCATE TABLE lakemeter.{table}")
+                for path in _pricing_paths(filename):
+                    copy_csv(raw_cursor, table, columns, path)
+            _apply_price_overlay(cursor)
+            _refresh_derived_reference_data(cursor)
+
+        cursor.execute(
+            """
+            INSERT INTO lakemeter.app_bootstrap_state (
+                singleton, app_version, pricing_checksum, bootstrapped_at
+            )
+            VALUES (TRUE, %s, %s, NOW())
+            ON CONFLICT (singleton) DO UPDATE SET
+                app_version = EXCLUDED.app_version,
+                pricing_checksum = EXCLUDED.pricing_checksum,
+                bootstrapped_at = EXCLUDED.bootstrapped_at
+            """,
+            (APP_VERSION, checksum),
+        )
+        connection.commit()
+        logger.info("SQLite bootstrap completed for app version %s", APP_VERSION)
+        return True
+    except Exception:
+        connection.rollback()
+        logger.exception("SQLite bootstrap failed")
+        raise
+    finally:
+        raw_cursor.close()
+        connection.close()

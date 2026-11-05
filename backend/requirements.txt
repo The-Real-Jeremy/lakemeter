@@ -1,0 +1,15 @@
+# Modified in lakemeter-sqlite, a fork of databrickslabs/lakemeter-oss: offline install from backend/wheels, no PostgreSQL drivers; upstream's list is requirements-postgres.txt.
+# Offline install: pip may only use the wheels shipped beside this file.
+--no-index
+--find-links wheels
+fastapi>=0.104.0
+uvicorn>=0.24.0
+sqlalchemy>=2.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-multipart>=0.0.6
+xlsxwriter>=3.1.9
+python-dotenv>=1.0.0
+cachetools>=5.3.0
+databricks-sdk>=0.123.0
+httpx>=0.25.0

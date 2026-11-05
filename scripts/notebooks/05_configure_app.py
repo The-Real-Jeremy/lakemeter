@@ -1,0 +1,287 @@
+# Databricks notebook source
+# MAGIC %md
+# MAGIC # Step 5: Configure Databricks App
+# MAGIC Creates/reuses the Databricks App, configures app resources (valueFrom secrets),
+# MAGIC generates app.yaml, and grants the app's Service Principal Lakebase access.
+
+# COMMAND ----------
+
+dbutils.widgets.text("project_id", "lakemeter-customer")
+dbutils.widgets.text("db_name", "lakemeter_pricing")
+dbutils.widgets.text("app_name", "lakemeter")
+dbutils.widgets.text("secrets_scope", "lakemeter-secrets")
+dbutils.widgets.text("claude_endpoint", "databricks-claude-opus-4-6")
+
+project_id = dbutils.widgets.get("project_id")
+db_name = dbutils.widgets.get("db_name")
+app_name = dbutils.widgets.get("app_name")
+secrets_scope = dbutils.widgets.get("secrets_scope")
+claude_endpoint = dbutils.widgets.get("claude_endpoint")
+
+print(f"Project: {project_id}")
+print(f"Database: {db_name}")
+print(f"App: {app_name}")
+print(f"Secrets scope: {secrets_scope}")
+print(f"Claude endpoint: {claude_endpoint}")
+
+# COMMAND ----------
+
+import re
+import requests
+import psycopg2
+from datetime import datetime
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.apps import App
+from databricks.sdk.service.postgres import (
+    Role,
+    RoleAuthMethod,
+    RoleIdentityType,
+    RoleRoleSpec,
+)
+
+w = WorkspaceClient()
+host = w.config.host.rstrip("/")
+user = w.current_user.me().user_name
+normalized_project_id = re.sub(
+    r"[^a-z0-9-]+",
+    "-",
+    project_id.strip().lower(),
+).strip("-")
+project_name = f"projects/{normalized_project_id}"
+branch_name = f"{project_name}/branches/production"
+endpoint_name = f"{branch_name}/endpoints/primary"
+
+# COMMAND ----------
+
+# 1. Ensure workspace secrets exist for config values
+print("Setting workspace secrets...")
+
+for key, value in {
+    "lakebase-project": project_name,
+    "lakebase-branch": branch_name,
+    "lakebase-endpoint": endpoint_name,
+}.items():
+    try:
+        w.secrets.put_secret(
+            scope=secrets_scope,
+            key=key,
+            string_value=value,
+        )
+        print(f"  {secrets_scope}:{key} set")
+    except Exception as e:
+        print(f"  Warning: Could not set {key}: {e}")
+
+# lakebase-host, lakebase-user, lakebase-database should already exist from 02_create_database
+# Verify they exist
+for key in ["lakebase-host", "lakebase-user", "lakebase-database"]:
+    try:
+        val = dbutils.secrets.get(scope=secrets_scope, key=key)
+        print(f"  {secrets_scope}:{key} exists")
+    except Exception:
+        print(f"  Warning: {secrets_scope}:{key} not found — may need manual setup")
+
+# COMMAND ----------
+
+# 2. Create app if it doesn't exist
+print(f"Checking for existing app '{app_name}'...")
+try:
+    app_info = w.apps.get(app_name)
+    print(f"App '{app_name}' already exists")
+except Exception:
+    print(f"Creating Databricks App '{app_name}'...")
+    try:
+        app_obj = App(
+            name=app_name,
+            description="Lakemeter — Databricks cost estimation tool",
+            default_source_code_path=f"/Workspace/Users/{user}/apps/{app_name}",
+        )
+        w.apps.create_and_wait(app_obj)
+        print(f"App '{app_name}' created")
+    except Exception as e:
+        print(f"Warning: Could not create app: {str(e)[:200]}")
+        print("You may need to create the app manually via the Databricks UI, then re-run the installer")
+
+# COMMAND ----------
+
+# 3. Configure app resources (valueFrom references)
+print("Configuring app resources...")
+
+# Resource names must be <= 30 chars. Use short fixed prefixes.
+resource_map = {
+    "lm-lakebase-project": ("lakebase-project", "Lakebase project"),
+    "lm-lakebase-branch": ("lakebase-branch", "Production branch"),
+    "lm-lakebase-endpoint": ("lakebase-endpoint", "Primary endpoint"),
+    "lm-db-host": ("lakebase-host", "Database host"),
+    "lm-db-user": ("lakebase-user", "Database user"),
+    "lm-db-name": ("lakebase-database", "Database name"),
+}
+
+resources = []
+for name, (secret_key, desc) in resource_map.items():
+    resources.append({
+        "name": name,
+        "description": desc,
+        "secret": {"scope": secrets_scope, "key": secret_key, "permission": "READ"},
+    })
+
+# Add serving endpoint resource for AI Assistant (Claude)
+resources.append({
+    "name": "lm-claude-endpoint",
+    "description": "Claude model endpoint for AI Assistant",
+    "serving_endpoint": {"name": claude_endpoint, "permission": "CAN_QUERY"},
+})
+
+headers = w.config.authenticate()
+resp = requests.patch(
+    f"{host}/api/2.0/apps/{app_name}",
+    headers=headers,
+    json={"resources": resources},
+)
+if resp.status_code == 200:
+    print(f"App resources configured ({len(resources)} resources)")
+else:
+    error_msg = f"Failed to configure app resources: {resp.status_code} {resp.text[:300]}"
+    print(f"ERROR: {error_msg}")
+    raise RuntimeError(error_msg)
+
+# COMMAND ----------
+
+# 4. Generate app.yaml and write to bundle files path
+print("Generating app.yaml...")
+
+app_yaml_content = f"""# Databricks App Configuration — generated by installer
+# Project: {project_name} | Generated: {datetime.now().isoformat()[:19]}
+
+command:
+  - "/bin/bash"
+  - "-c"
+  - |
+    # Start FastAPI backend (frontend is pre-built into backend/static/)
+    cd backend && ../.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port ${{DATABRICKS_APP_PORT:-8000}}
+
+env:
+  # App environment
+  - name: "ENVIRONMENT"
+    value: "production"
+  - name: "CORS_ORIGINS"
+    value: ""
+
+  # Lakebase Autoscaling database configuration
+  - name: "LAKEBASE_PROJECT"
+    valueFrom: "lm-lakebase-project"
+  - name: "LAKEBASE_BRANCH"
+    valueFrom: "lm-lakebase-branch"
+  - name: "LAKEBASE_ENDPOINT"
+    valueFrom: "lm-lakebase-endpoint"
+  - name: "DB_HOST"
+    valueFrom: "lm-db-host"
+  - name: "DB_USER"
+    valueFrom: "lm-db-user"
+  - name: "DB_NAME"
+    valueFrom: "lm-db-name"
+  - name: "DB_PORT"
+    value: "5432"
+  - name: "DB_SSLMODE"
+    value: "require"
+
+  # AI Assistant (Claude) model serving endpoint
+  - name: "CLAUDE_MODEL_ENDPOINT"
+    valueFrom: "lm-claude-endpoint"
+"""
+
+import os
+# Write to bundle's app_source directory so 06_deploy_app can copy it
+nb_context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+nb_path = nb_context.notebookPath().get()
+if not nb_path.startswith("/Workspace"):
+    nb_path = "/Workspace" + nb_path
+bundle_files_dir = os.path.dirname(os.path.dirname(nb_path))
+app_source_dir = os.path.join(bundle_files_dir, "app_source")
+app_yaml_path = os.path.join(app_source_dir, "app.yaml")
+
+with open(app_yaml_path, "w") as f:
+    f.write(app_yaml_content)
+print(f"app.yaml written to {app_yaml_path}")
+
+# Also store as task value so deploy notebook can find it
+dbutils.jobs.taskValues.set(key="app_yaml_path", value=app_yaml_path)
+
+# COMMAND ----------
+
+# 5. Grant app Service Principal Lakebase access
+print("Granting app service principal Lakebase access...")
+
+try:
+    app_info = w.apps.get(app_name)
+    app_sp_id = app_info.service_principal_client_id
+    if not app_sp_id:
+        print("Warning: App has no service principal — Lakebase OAuth will not work")
+        print("App will use password-auth fallback (lakemeter_sync_role)")
+        dbutils.notebook.exit("App configured (no SP — password auth fallback)")
+
+    # Create a direct Autoscaling OAuth role for the app's SP.
+    existing_roles = list(w.postgres.list_roles(parent=branch_name))
+    sp_role = next(
+        (
+            role
+            for role in existing_roles
+            if getattr(
+                getattr(role, "spec", None)
+                or getattr(role, "status", None),
+                "postgres_role",
+                None,
+            )
+            == app_sp_id
+        ),
+        None,
+    )
+
+    if not sp_role:
+        w.postgres.create_role(
+            parent=branch_name,
+            role_id=f"{app_name.lower().replace('_', '-')}-app",
+            role=Role(
+                spec=RoleRoleSpec(
+                    auth_method=RoleAuthMethod.LAKEBASE_OAUTH_V1,
+                    identity_type=RoleIdentityType.SERVICE_PRINCIPAL,
+                    postgres_role=app_sp_id,
+                )
+            ),
+        ).wait()
+        print(f"App SP Lakebase role created ({app_sp_id[:12]}...)")
+    else:
+        print("App SP already has Lakebase role")
+
+    # Grant SQL-level permissions
+    endpoint = w.postgres.get_endpoint(name=endpoint_name)
+    instance_host = endpoint.status.hosts.host
+    cred = w.postgres.generate_database_credential(endpoint=endpoint_name)
+    owner_user = w.current_user.me().user_name
+
+    conn = psycopg2.connect(
+        host=instance_host, port=5432, database=db_name,
+        user=owner_user, password=cred.token, sslmode="require",
+    )
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute(f'GRANT CONNECT ON DATABASE {db_name} TO "{app_sp_id}"')
+    cur.execute(f'GRANT USAGE ON SCHEMA lakemeter TO "{app_sp_id}"')
+    cur.execute(f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA lakemeter TO "{app_sp_id}"')
+    cur.execute(f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA lakemeter TO "{app_sp_id}"')
+    cur.execute(f'GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA lakemeter TO "{app_sp_id}"')
+    cur.execute(
+        f'ALTER DEFAULT PRIVILEGES IN SCHEMA lakemeter '
+        f'GRANT ALL PRIVILEGES ON TABLES TO "{app_sp_id}"'
+    )
+    cur.close()
+    conn.close()
+    print("App SP SQL permissions granted")
+
+except Exception as e:
+    print(f"Warning: Could not configure app SP Lakebase access: {e}")
+    print("App will use password-auth fallback (lakemeter_sync_role)")
+
+# COMMAND ----------
+
+print("App configuration complete.")
+dbutils.notebook.exit(f"App '{app_name}' configured with {len(resources)} resources")

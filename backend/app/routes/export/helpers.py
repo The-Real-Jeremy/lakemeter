@@ -1,0 +1,368 @@
+"""Access control and display helper functions for export."""
+from uuid import UUID
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from app.models import Estimate, User
+from app.models.sharing import Sharing
+from app.services.model_serving_pricing import (
+    get_billing_capacity_units,
+    is_gpu_workload_type,
+)
+
+
+def _get_json_backed_value(item, field, default=None):
+    """Read a public field from an attribute or workload_config."""
+    value = getattr(item, field, None)
+    if value is not None:
+        return value
+    workload_config = getattr(item, 'workload_config', None) or {}
+    return workload_config.get(field, default)
+
+
+def _check_estimate_access(estimate_id: UUID, user: User, db: Session) -> Estimate:
+    """Check if user has access to an estimate."""
+    estimate = db.query(Estimate).filter(
+        Estimate.estimate_id == estimate_id,
+        Estimate.is_deleted == False
+    ).first()
+    if not estimate:
+        raise HTTPException(status_code=404, detail="Estimate not found")
+    is_owner = estimate.owner_user_id == user.user_id
+    is_shared = db.query(Sharing).filter(
+        Sharing.estimate_id == estimate_id,
+        Sharing.shared_with_user_id == user.user_id
+    ).first() is not None
+    if not is_owner and not is_shared:
+        raise HTTPException(status_code=404, detail="Estimate not found")
+    return estimate
+
+
+def _get_workload_display_name(workload_type: str) -> str:
+    """Get friendly display name for workload type."""
+    names = {
+        'JOBS': 'Lakeflow Job Compute',
+        'ALL_PURPOSE': 'All-Purpose Compute',
+        'DLT': 'Lakeflow Spark Declarative Pipelines',
+        'DBSQL': 'Databricks SQL',
+        'VECTOR_SEARCH': 'AI Search',
+        'MODEL_SERVING': 'Model Serving',
+        'AI_RUNTIME': 'AI Runtime',
+        'GENERAL_STORAGE': 'Databricks Default Storage',
+        'FMAPI_DATABRICKS': 'Foundation Models (Databricks)',
+        'FMAPI_PROPRIETARY': 'Foundation Models (Proprietary)',
+        'LAKEBASE': 'Lakebase',
+        'DATABRICKS_APPS': 'Databricks Apps',
+        'AI_PARSE': 'AI Parse (Document AI)',
+        'SHUTTERSTOCK_IMAGEAI': 'Shutterstock ImageAI',
+        'AI_EXTRACT': 'AI Extract',
+        'AI_CLASSIFY': 'AI Classify',
+        'AI_GATEWAY': 'Unity AI Gateway',
+        'AGENT_EVALUATION': 'Agent Evaluation',
+        'ZEROBUS': 'Zerobus Ingest',
+        'LAKEFLOW_CONNECT': 'Lakeflow Connect',
+    }
+    return names.get(workload_type, workload_type)
+
+
+def _get_workload_config_details(item) -> str:
+    """Get workload-specific configuration details for display."""
+    wt = item.workload_type or ''
+    details = []
+
+    if wt in ('JOBS', 'ALL_PURPOSE', 'DLT') and item.serverless_enabled:
+        serverless_mode = (item.serverless_mode or 'standard').capitalize()
+        details.append(f"Mode: {serverless_mode}")
+
+    if wt == 'DBSQL':
+        details.extend(_dbsql_details(item))
+    elif wt == 'VECTOR_SEARCH':
+        details.extend(_vector_search_details(item))
+    elif wt == 'MODEL_SERVING':
+        details.extend(_model_serving_details(item))
+    elif wt == 'AI_RUNTIME':
+        from app.services.ai_runtime_pricing import (
+            get_ai_runtime_accelerator,
+        )
+
+        accelerator = _get_json_backed_value(
+            item,
+            'ai_runtime_accelerator_type',
+            'GPU_1xA10',
+        )
+        try:
+            profile = get_ai_runtime_accelerator(
+                'aws',
+                accelerator,
+            )
+            details.append(
+                f"Accelerator: {profile['display_name']}"
+            )
+        except ValueError:
+            details.append(f"Accelerator: {accelerator}")
+    elif wt == 'GENERAL_STORAGE':
+        quantity = float(_get_json_backed_value(
+            item,
+            'general_storage_quantity',
+            0,
+        ) or 0)
+        unit = str(_get_json_backed_value(
+            item,
+            'general_storage_unit',
+            'gb',
+        ) or 'gb').upper()
+        details.append(f"Stored capacity: {quantity:g} {unit}/mo")
+        tier1 = float(_get_json_backed_value(
+            item,
+            'general_storage_tier1_operations_thousands',
+            0,
+        ) or 0)
+        tier2 = float(_get_json_backed_value(
+            item,
+            'general_storage_tier2_operations_thousands',
+            0,
+        ) or 0)
+        details.append(f"Tier 1 operations: {tier1:g}K/mo")
+        details.append(f"Tier 2 operations: {tier2:g}K/mo")
+    elif wt in ('FMAPI_DATABRICKS', 'FMAPI_PROPRIETARY'):
+        details.extend(_fmapi_details(item))
+    elif wt == 'LAKEBASE':
+        details.extend(_lakebase_details(item))
+    elif wt == 'DLT':
+        details.extend(_dlt_details(item))
+    elif wt == 'DATABRICKS_APPS':
+        size = (getattr(item, 'databricks_apps_size', None) or 'medium').capitalize()
+        details.append(f"Size: {size}")
+        num_apps = max(
+            int(getattr(item, 'databricks_apps_num_apps', None) or 1),
+            1,
+        )
+        details.append(f"Apps: {num_apps}")
+    elif wt == 'AI_PARSE':
+        details.extend(_ai_parse_details(item))
+    elif wt == 'SHUTTERSTOCK_IMAGEAI':
+        images = getattr(item, 'shutterstock_images', None)
+        if images is None:
+            images = getattr(item, 'shutterstock_imageai_num_images', 0)
+        images = int(images or 0)
+        details.append(f"Images/mo: {images:,}")
+    elif wt == 'AI_EXTRACT':
+        doc_type = _get_json_backed_value(
+            item, 'ai_extract_document_type', 'invoice'
+        ) or 'invoice'
+        inputs = float(_get_json_backed_value(
+            item, 'ai_extract_num_inputs', 0
+        ) or 0)
+        details.append(f"Type: {doc_type}")
+        details.append(f"Inputs/mo: {inputs:,.0f}")
+        details.append("Document files require AI Parse")
+    elif wt == 'AI_CLASSIFY':
+        doc_type = _get_json_backed_value(
+            item, 'ai_classify_document_type', 'short_text'
+        ) or 'short_text'
+        docs = float(_get_json_backed_value(
+            item, 'ai_classify_num_docs', 0
+        ) or 0)
+        details.append(f"Type: {doc_type}")
+        details.append(f"Docs/mo: {docs:,.0f}")
+        details.append("Document files require AI Parse")
+    elif wt == 'AI_GATEWAY':
+        from .excel_item_helpers import get_ai_gateway_usage
+
+        usage = get_ai_gateway_usage(item)
+        for component in usage["components"]:
+            details.append(
+                f"{component['display_name']}: "
+                f"{component['monthly_payload_gb']:g} GB, "
+                f"{component['monthly_dbus']:g} DBUs"
+            )
+    elif wt == 'AGENT_EVALUATION':
+        from .excel_item_helpers import get_agent_evaluation_usage
+
+        usage = get_agent_evaluation_usage(item)
+        for component in usage["components"]:
+            details.append(
+                f"{component['display_name']}: "
+                f"{component['quantity']:g} "
+                f"{component['quantity_unit'].replace('_', ' ')}, "
+                f"{component['monthly_dbus']:g} DBUs"
+            )
+    elif wt == 'ZEROBUS':
+        from .excel_item_helpers import get_zerobus_usage
+
+        usage = get_zerobus_usage(item)
+        details.append(f"Type: {usage['mode_display_name']}")
+        details.append(
+            f"Ingested data: {usage['monthly_ingested_gb']:g} GB/mo"
+        )
+        details.append(f"Metering: {usage['dbu_per_gb']:g} DBU/GB")
+    elif wt == 'LAKEFLOW_CONNECT':
+        details.extend(_lakeflow_connect_details(item))
+
+    return ' | '.join(details) if details else '-'
+
+
+def _dbsql_details(item) -> list:
+    details = []
+    if item.dbsql_warehouse_type:
+        details.append(f"Type: {item.dbsql_warehouse_type}")
+    if item.dbsql_warehouse_size:
+        details.append(f"Size: {item.dbsql_warehouse_size}")
+    if item.dbsql_num_clusters and item.dbsql_num_clusters > 1:
+        details.append(f"Clusters: {item.dbsql_num_clusters}")
+    return details
+
+
+def _vector_search_details(item) -> list:
+    details = []
+    mode = item.vector_search_mode or 'standard'
+    mode_display = 'Storage Optimized' if mode == 'storage_optimized' else 'Standard'
+    details.append(f"Mode: {mode_display}")
+    if item.vector_capacity_millions:
+        details.append(f"Capacity: {item.vector_capacity_millions}M vectors")
+    if _get_json_backed_value(item, 'ai_search_reranker_enabled', False):
+        requests = float(_get_json_backed_value(
+            item,
+            'ai_search_reranker_requests_thousands',
+            0,
+        ) or 0)
+        details.append(f"Reranker: {requests:g}K requests/mo")
+    return details
+
+
+MODEL_SERVING_GPU_NAMES = {
+    'cpu': 'CPU',
+    'gpu_small_t4': 'Small (T4)',
+    'gpu_medium_a10g_1x': 'Medium (A10G 1x)',
+    'gpu_medium_a10g_4x': 'Medium (A10G 4x)',
+    'gpu_medium_a10g_8x': 'Medium (A10G 8x)',
+    'gpu_large_a10g_4x': 'Large (A10G 4x)',
+    'gpu_medium_a100_1x': 'Medium (A100 1x)',
+    'gpu_large_a100_2x': 'Large (A100 2x)',
+    'gpu_xlarge_a100_40gb_8x': 'XLarge (A100 40GB 8x)',
+    'gpu_xlarge_a100_80gb_8x': 'XLarge (A100 80GB 8x)',
+    'gpu_xlarge_a100_80gb_1x': 'XLarge (A100 80GB 1x)',
+    'gpu_2xlarge_a100_80gb_2x': '2XLarge (A100 80GB 2x)',
+    'gpu_4xlarge_a100_80gb_4x': '4XLarge (A100 80GB 4x)',
+    'gpu_medium_g2_standard_8': 'Medium (G2 Standard 8)',
+}
+
+
+def _model_serving_details(item) -> list:
+    details = []
+    workload_type = item.model_serving_gpu_type or 'cpu'
+    if item.model_serving_gpu_type:
+        name = MODEL_SERVING_GPU_NAMES.get(
+            item.model_serving_gpu_type, item.model_serving_gpu_type
+        )
+        details.append(f"GPU: {name}")
+    # Show concurrency (from dedicated column or default 4)
+    concurrency = getattr(item, 'model_serving_concurrency', None) or 4
+    scale_out = getattr(item, 'model_serving_scale_out', None) or 'small'
+    scale_labels = {'small': 'Small', 'medium': 'Medium', 'large': 'Large', 'custom': 'Custom'}
+    label = scale_labels.get(scale_out, scale_out)
+    details.append(f"Scale-Out: {label} ({concurrency} concurrency)")
+    if is_gpu_workload_type(workload_type):
+        replicas = get_billing_capacity_units(workload_type, concurrency)
+        details.append(f"GPU Replicas: {replicas:g}")
+    return details
+
+
+def _fmapi_details(item) -> list:
+    details = []
+    if item.fmapi_model:
+        details.append(f"Model: {item.fmapi_model}")
+    if item.fmapi_rate_type:
+        rate_type_display = {
+            'input_token': 'Input Tokens',
+            'output_token': 'Output Tokens',
+            'cache_read': 'Cache Read',
+            'cache_write': 'Cache Write',
+            'batch_inference': 'Batch Inference',
+            'provisioned_scaling': 'Provisioned Scaling',
+            'provisioned_entry': 'Provisioned Entry',
+            'provisioned_scaling_1_month': 'Provisioned Scaling (1-month reservation)',
+            'provisioned_scaling_3_month': 'Provisioned Scaling (3-month reservation)',
+            'provisioned_entry_1_month': 'Provisioned Entry (1-month reservation)',
+            'provisioned_entry_3_month': 'Provisioned Entry (3-month reservation)',
+        }
+        fallback_label = item.fmapi_rate_type.replace('_', ' ').title()
+        details.append(
+            f"Rate: {rate_type_display.get(item.fmapi_rate_type, fallback_label)}"
+        )
+    if item.fmapi_quantity:
+        token_types = ('input_token', 'output_token', 'cache_read', 'cache_write')
+        if item.fmapi_rate_type in token_types:
+            details.append(f"Tokens: {float(item.fmapi_quantity):.1f}M/mo")
+        else:
+            details.append(f"Hours: {item.fmapi_quantity}")
+    return details
+
+
+def _lakebase_details(item) -> list:
+    details = []
+    config = getattr(item, 'workload_config', None) or {}
+    min_cu = config.get('lakebase_min_cu') or item.lakebase_cu
+    max_cu = config.get('lakebase_max_cu') or min_cu
+    scale_to_zero = config.get('lakebase_scale_to_zero_enabled')
+    scale_up_hours = config.get('lakebase_scale_up_hours_per_month')
+    if min_cu:
+        details.append(f"CU range: {min_cu}-{max_cu}")
+    if scale_to_zero is not None:
+        details.append(f"Scale to zero: {'Yes' if scale_to_zero else 'No'}")
+    if scale_up_hours:
+        details.append(f"Scale-up hours: {scale_up_hours}")
+    if item.lakebase_ha_nodes:
+        details.append(f"Nodes: {item.lakebase_ha_nodes}")
+    return details
+
+
+def _dlt_details(item) -> list:
+    details = []
+    if item.dlt_edition:
+        details.append(f"Edition: {item.dlt_edition.upper()}")
+    if item.photon_enabled:
+        details.append("Photon")
+    return details
+
+
+def _ai_parse_details(item) -> list:
+    details = []
+    mode = getattr(item, 'ai_parse_mode', None)
+    if mode is None:
+        mode = (
+            getattr(item, 'ai_parse_calculation_method', None) or 'pages'
+        ).removesuffix('_based')
+    if mode == 'dbu':
+        details.append("Mode: Direct DBU")
+    else:
+        complexity_labels = {
+            'low_text': 'Low (Text Only)',
+            'low_images': 'Low (With Images)',
+            'medium': 'Medium',
+            'high': 'High',
+        }
+        complexity = getattr(item, 'ai_parse_complexity', None) or 'medium'
+        details.append(f"Complexity: {complexity_labels.get(complexity, complexity)}")
+        pages = getattr(item, 'ai_parse_pages_thousands', None)
+        if pages is None:
+            pages = float(getattr(item, 'ai_parse_num_pages', 0) or 0) / 1000
+        details.append(f"Pages: {float(pages):.0f}K")
+    return details
+
+
+def _lakeflow_connect_details(item) -> list:
+    details = []
+    details.append("Pipeline: DLT Serverless")
+    if getattr(item, 'lakeflow_connect_gateway_enabled', False):
+        gw_instance = getattr(item, 'lakeflow_connect_gateway_instance', None) or 'default'
+        details.append(f"Gateway: {gw_instance}")
+    return details
+
+
+def _get_pricing_tier_display(tier: str) -> str:
+    displays = {
+        'on_demand': 'On-Demand', 'spot': 'Spot',
+        'reserved_1y': '1-Year Reserved', 'reserved_3y': '3-Year Reserved',
+    }
+    return displays.get(tier, tier or '-')

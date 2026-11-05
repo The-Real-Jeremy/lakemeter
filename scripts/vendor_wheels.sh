@@ -5,8 +5,8 @@
 #   scripts/vendor_wheels.sh          # PY=python3.12 chooses the interpreter that runs pip
 #
 # backend/wheels holds only what the Databricks Apps Python 3.11 runtime does NOT pre-install:
-# SQLAlchemy, pydantic-settings, XlsxWriter and the Databricks SDK, plus the small pure-Python
-# dependencies they need recent versions of. FastAPI, Uvicorn, pydantic, httpx, cryptography and
+# SQLAlchemy, pydantic-settings, XlsxWriter and the Databricks SDK, plus the small dependencies
+# they need (pure Python, and the compiled protobuf and charset_normalizer). FastAPI, Uvicorn, pydantic, httpx, cryptography and
 # the other pre-installed libraries come from the runtime ("Requirement already satisfied"), which
 # keeps the repo ZIP under the 10 MB workspace-import limit. If a runtime ever lacks one, the
 # deploy stops and names the package: add it to VENDOR below and run this again.
@@ -18,11 +18,18 @@ VENDOR=(
   certifi python-dotenv typing-inspection typing-extensions urllib3 requests idna
   google-auth pyasn1 pyasn1-modules
 )
+# Compiled, but small: vendored rather than trusted to the runtime (databricks-sdk needs protobuf,
+# requests needs charset_normalizer). Built for the Apps runtime: linux x86_64, CPython 3.11.
+VENDOR_COMPILED=(protobuf charset_normalizer)
 new="$(mktemp -d)"
 # --platform any: pure-Python wheels only (SQLAlchemy ships one; no compiled code to match).
 "$PY" -m pip download --disable-pip-version-check --only-binary=:all: --no-deps \
   --platform any --python-version 3.11 --implementation py --abi none \
   -d "$new" "${VENDOR[@]}" >/dev/null
+"$PY" -m pip download --disable-pip-version-check --only-binary=:all: --no-deps \
+  --platform manylinux2014_x86_64 --platform manylinux_2_17_x86_64 --platform manylinux_2_28_x86_64 \
+  --python-version 3.11 --implementation cp --abi cp311 --abi abi3 \
+  -d "$new" "${VENDOR_COMPILED[@]}" >/dev/null
 rm -rf "$repo/backend/wheels"
 mv "$new" "$repo/backend/wheels"
 echo "backend/wheels: $(ls "$repo/backend/wheels" | wc -l | tr -d ' ') wheels, $(du -sh "$repo/backend/wheels" | cut -f1)"

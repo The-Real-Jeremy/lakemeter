@@ -17,8 +17,9 @@ import os, re, shutil, time, json
 ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
 SRC = "/Workspace" + os.path.dirname(ctx.notebookPath().get())
 PARENT = os.path.dirname(SRC)
-guess = next((os.path.join(PARENT, d) for d in sorted(os.listdir(PARENT))
-              if d.startswith("app-catalog") and os.path.isfile(os.path.join(PARENT, d, "catalog", "server.mjs"))), "")
+# Prefer the folder named exactly app-catalog-main (an old copy renamed aside must not win).
+_cands = [d for d in sorted(os.listdir(PARENT)) if d.startswith("app-catalog") and os.path.isfile(os.path.join(PARENT, d, "catalog", "server.mjs"))]
+guess = os.path.join(PARENT, "app-catalog-main") if "app-catalog-main" in _cands else (os.path.join(PARENT, _cands[0]) if _cands else "")
 
 dbutils.widgets.dropdown("mode", "child", ["child", "standalone"], "1. Mode")
 dbutils.widgets.text("catalog_folder", guess, "2. (child) App Catalog folder")

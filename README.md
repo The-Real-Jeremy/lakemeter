@@ -53,7 +53,8 @@ In child mode `DEPLOY` keeps the previous child copy as `.bak-child-lakemeter-<t
   red banner.
 * **Offline install.** `backend/requirements.txt` is `--no-index --find-links wheels`. The packages
   the Databricks Apps runtime does not pre-install (SQLAlchemy, pydantic-settings, XlsxWriter, the
-  Databricks SDK and a few small dependencies; 14 pure-Python wheels) are committed in `backend/wheels`;
+  Databricks SDK and a few small dependencies, including the compiled protobuf and charset_normalizer for
+  linux x86_64 / CPython 3.11; 16 wheels) are committed in `backend/wheels`;
   FastAPI, Uvicorn, pydantic and the rest come from the runtime. The frontend is prebuilt in `backend/static`.
 * **AI assistant off when there is no model endpoint.** Chat answers `503`, and the panel and its
   button are not shown.
@@ -116,8 +117,8 @@ The GitHub ZIP *is* the air-gapped package: carry `lakemeter-main.zip` in throug
 channel and follow **Install** above. Nothing is fetched at install or at runtime:
 
 * `backend/requirements.txt` is `--no-index --find-links wheels`. `backend/wheels` holds the packages the
-  Databricks Apps Python 3.11 runtime does not pre-install (14 pure-Python wheels); the rest are already on
-  the runtime. The build log shows `Looking in links: …/wheels` and never `Looking in indexes`; a missing
+  Databricks Apps Python 3.11 runtime does not pre-install (16 wheels); the rest (FastAPI, Uvicorn, pydantic,
+  httpx, cryptography, …) are already on the runtime. The build log shows `Looking in links: …/wheels` and never `Looking in indexes`; a missing
   package stops the build with its name rather than hanging on the network (add it with
   `scripts/vendor_wheels.sh`).
 * The frontend is prebuilt in `backend/static`; the prices are in `backend/static/pricing` and `backend/prices`.

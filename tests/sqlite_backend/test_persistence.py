@@ -291,3 +291,12 @@ def test_persistence_none_still_calculates_and_says_so(workdir):
         assert app.client.get(f"/estimates/{estimate_id}").status_code == 200
     finally:
         app.stop()
+
+
+def test_missing_workspace_file_counts_as_no_snapshot():
+    """The Workspace API says "Path (...) doesn't exist." for a first start in app_home."""
+    import sys
+    sys.path.insert(0, str(BACKEND))
+    from app.persistence import _is_not_found
+    assert _is_not_found(Exception("Path (/Workspace/Users/x/lakemeter/lakemeter-data.db) doesn't exist."))
+    assert not _is_not_found(Exception("PERMISSION_DENIED"))

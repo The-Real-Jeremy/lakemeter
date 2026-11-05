@@ -116,8 +116,8 @@ class _LocalStore(_Store):
 def _is_not_found(error: Exception) -> bool:
     text = f"{type(error).__name__} {error}".lower()
     return any(marker in text for marker in (
-        "notfound", "not_found", "not found", "does not exist", "resource_does_not_exist",
-        "404"))
+        "notfound", "not_found", "not found", "does not exist", "doesn't exist",
+        "resource_does_not_exist", "404"))
 
 
 class _VolumeStore(_Store):

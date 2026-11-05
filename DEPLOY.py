@@ -16,6 +16,21 @@
 import os, re, shutil, time, json
 ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
 SRC = "/Workspace" + os.path.dirname(ctx.notebookPath().get())
+# A ZIP import can still be unzipping when Run all starts: wait until the file count here stops changing.
+# Count through the Workspace API: the notebook's /Workspace file view can lag the import by minutes.
+from databricks.sdk import WorkspaceClient as _WC
+_wsapi = _WC().workspace
+def _nfiles(p):
+    return sum(_nfiles(o.path) if o.object_type.value == "DIRECTORY" else 1 for o in _wsapi.list(p))
+_n, _t0, _since = _nfiles(SRC[len("/Workspace"):]), time.time(), time.time()
+print(f"checking the import is complete: {_n} files", flush=True)
+while time.time() - _since < 20 and time.time() - _t0 < 180:
+    time.sleep(5)
+    _m = _nfiles(SRC[len("/Workspace"):])
+    if _m != _n:
+        _n, _since = _m, time.time()
+        print(f"  still importing: {_n} files …", flush=True)
+print(f"import complete: {_n} files" if time.time() - _since >= 20 else f"still changing after 3 min ({_n} files); carrying on")
 PARENT = os.path.dirname(SRC)
 # Prefer the folder named exactly app-ception-main, then app-catalog-main (an old copy renamed aside must not
 # win), else the first sibling folder that has catalog/server.mjs.
@@ -162,7 +177,16 @@ def deploy(name, source):
             print("  start:", str(e)[:120])
         wait_compute(name, {"ACTIVE"})
     print(f"deploying {source} → {name} …")
-    dep = api.do("POST", f"/api/2.0/apps/{name}/deployments", body={"source_code_path": source, "mode": "SNAPSHOT"})
+    # Starting a STOPPED app redeploys its last build, and a new deployment is refused while that runs.
+    for _try in range(60):
+        try:
+            dep = api.do("POST", f"/api/2.0/apps/{name}/deployments", body={"source_code_path": source, "mode": "SNAPSHOT"})
+            break
+        except Exception as e:
+            if "deployment in progress" not in str(e) or _try == 59:
+                raise
+            print(f"  the app is still finishing its previous deployment; retrying in 20 s ({_try + 1}/60) …", flush=True)
+            time.sleep(20)
     t0 = time.time()
     while True:
         d = api.do("GET", f"/api/2.0/apps/{name}/deployments/{dep['deployment_id']}")

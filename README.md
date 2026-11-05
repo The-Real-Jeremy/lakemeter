@@ -15,22 +15,22 @@ Two ways to install it; both use the `DEPLOY` notebook.
    asks you to paste one into **budget_policy_id**.
 4. The last cell prints the **app URL** and the app's health (SQLite, saved, prices as of).
 
-### B) Install as a child of the [App Catalog](https://github.com/The-Real-Jeremy/app-catalog)
-1. Install the App Catalog first (its README, same four steps), so `app-catalog-main/` is in your workspace.
+### B) Install as a child of [App-ception](https://github.com/The-Real-Jeremy/app-ception)
+1. Install App-ception first (its README, same four steps), so `app-ception-main/` is in your workspace.
 2. On this GitHub page: **Code → Download ZIP** (`lakemeter-main.zip`).
-3. In Databricks: open **the same folder that holds `app-catalog-main/`** → **⋮ → Import** → drop the `.zip`.
-   It unzips into `lakemeter-main/` next to the catalog.
-4. Give the **catalog app** the volume that keeps the estimates: Compute → Apps → the catalog app → Edit →
+3. In Databricks: open **the same folder that holds `app-ception-main/`** → **⋮ → Import** → drop the `.zip`.
+   It unzips into `lakemeter-main/` next to App-ception.
+4. Give the **App-ception app** the volume that keeps the estimates: Compute → Apps → the App-ception app → Edit →
    App resources → **+ Add resource → UC volume**, permission **Can read and write**, key
    **`lakemeter--snapshot-volume`**. (Without it the app runs but shows a red banner: estimates are not kept.)
 5. Open **`lakemeter-main/DEPLOY`**, attach **Serverless**, leave **mode = `child`** (`catalog_folder` is
-   filled in for you), then **Run all**. It copies the app into the catalog's `child_apps/lakemeter/` and
-   redeploys the catalog; it does not create or change any app. The last cell prints
-   `<catalog URL>/apps/lakemeter/` and checks the volume from step 4.
+   filled in for you), then **Run all**. It copies the app into App-ception's `child_apps/lakemeter/` and
+   redeploys App-ception; it does not create or change any app. The last cell prints
+   `<App-ception URL>/apps/lakemeter/` and checks the volume from step 4.
 
 To update either way: first **rename or delete the old `lakemeter-main/` folder** (an import onto an
 existing folder is refused with `RESOURCE_ALREADY_EXISTS` and the old folder stays), then import the new ZIP and
-**Run all** `DEPLOY`. After re-importing the App Catalog itself, re-run each child's `DEPLOY` in child mode.
+**Run all** `DEPLOY`. After re-importing App-ception itself, re-run each child's `DEPLOY` in child mode.
 In child mode `DEPLOY` keeps the previous child copy as `.bak-child-lakemeter-<time>`, never deletes it.
 
 ---
@@ -87,17 +87,17 @@ The app needs no user-authorization (on-behalf-of) scopes. To use Lakebase inste
 | `LAKEMETER_AI_ASSISTANT` | `auto` | `auto` (on only if the endpoint exists), `on` or `off` |
 | `CLAUDE_MODEL_ENDPOINT` | `databricks-claude-opus-4-6` | Serving endpoint the assistant uses |
 
-## As a child of the [App Catalog](https://github.com/The-Real-Jeremy/app-catalog)
+## As a child of [App-ception](https://github.com/The-Real-Jeremy/app-ception)
 
 Install **B** above does this from the browser. What it amounts to:
 
-* `catalog.yaml` points the catalog at `backend/` (`app_dir: backend`, `mount: root`). The catalog installs the
-  vendored wheels offline, serves the app at `/apps/lakemeter/`, and runs it as the catalog app's service
+* `catalog.yaml` points App-ception at `backend/` (`app_dir: backend`, `mount: root`). App-ception installs the
+  vendored wheels offline, serves the app at `/apps/lakemeter/`, and runs it as the App-ception app's service
   principal. No user-authorization (on-behalf-of) scopes are needed.
-* Persistence needs one resource on the **catalog app**: a UC volume with **Can read and write**
-  (`WRITE_VOLUME`), key `lakemeter--snapshot-volume` (or `snapshot-volume`). The catalog resolves the child's
-  `valueFrom: snapshot-volume` to that volume's `catalog.schema.volume` name, which the app accepts. With the
-  catalog's `npm run deploy`, declare it in `catalog.overrides.yaml` instead:
+* Persistence needs one resource on the **App-ception app**: a UC volume with **Can read and write**
+  (`WRITE_VOLUME`), key `lakemeter--snapshot-volume` (or `snapshot-volume`). App-ception resolves the child's
+  `valueFrom: snapshot-volume` to that volume's `catalog.schema.volume` name, which the app accepts. With
+  App-ception's `npm run deploy`, declare it in `catalog.overrides.yaml` instead:
 
   ```yaml
   lakemeter:
@@ -108,8 +108,8 @@ Install **B** above does this from the browser. What it amounts to:
           securable_type: VOLUME
           permission: WRITE_VOLUME
   ```
-* The copy the catalog needs is `catalog.yaml` plus `backend/`; `DEPLOY` copies only those (and the licence
-  files), so the catalog's deploy carries just the app.
+* The copy App-ception needs is `catalog.yaml` plus `backend/`; `DEPLOY` copies only those (and the licence
+  files), so App-ception's deploy carries just the app.
 
 ## Air-gapped / UI only
 

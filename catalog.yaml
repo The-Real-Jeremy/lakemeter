@@ -1,4 +1,4 @@
-# Card metadata for running this app as a child of the App Catalog (ignored when deployed standalone).
+# Card metadata for running this app as a child of App-ception (ignored when deployed standalone).
 title: Lakemeter (SQLite)
 description: Databricks pricing calculator (lakemeter-oss) with a SQLite backend, for workspaces with no Lakebase. Estimates live in a SQLite file that is copied to a UC volume after every save; it installs offline from vendored wheels, and the AI assistant hides itself when there is no model endpoint.
 app_dir: backend

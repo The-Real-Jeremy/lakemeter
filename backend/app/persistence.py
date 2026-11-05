@@ -276,7 +276,7 @@ class PersistenceManager:
 
         path = os.getenv("LAKEMETER_SNAPSHOT_PATH", "").strip().rstrip("/")
         if re.fullmatch(r"[^/.\s]+\.[^/.\s]+\.[^/.\s]+", path):
-            # A UC volume's three-part name (what the App Catalog resolves a volume
+            # A UC volume's three-part name (what App-ception resolves a volume
             # resource to): <catalog>.<schema>.<volume> -> /Volumes/<catalog>/<schema>/<volume>
             path = "/Volumes/" + path.replace(".", "/")
         if path and not path.endswith(".db"):

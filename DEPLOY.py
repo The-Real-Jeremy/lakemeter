@@ -3,9 +3,9 @@
 # MAGIC # Deploy Lakemeter (SQLite) (browser only)
 # MAGIC
 # MAGIC Two ways, chosen with the **mode** widget:
-# MAGIC - **child**: add it to an App Catalog that you deployed from `app-catalog-main/` (the default).
-# MAGIC   It copies the app into the catalog's `child_apps/lakemeter/` and redeploys the catalog. It never creates
-# MAGIC   or changes the catalog app; it tells you if the catalog app still needs the snapshot volume.
+# MAGIC - **child**: add it to an App-ception that you deployed from `app-ception-main/` (the default).
+# MAGIC   It copies the app into App-ception's `child_apps/lakemeter/` and redeploys App-ception. It never creates
+# MAGIC   or changes the App-ception app; it tells you if that app still needs the snapshot volume.
 # MAGIC - **standalone**: deploy it as its own Databricks App, with a UC volume that keeps the estimates.
 # MAGIC
 # MAGIC Needs no CLI, pip or npm: only the Databricks SDK the notebook already has. The app installs offline from
@@ -17,13 +17,15 @@ import os, re, shutil, time, json
 ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
 SRC = "/Workspace" + os.path.dirname(ctx.notebookPath().get())
 PARENT = os.path.dirname(SRC)
-# Prefer the folder named exactly app-catalog-main (an old copy renamed aside must not win).
-_cands = [d for d in sorted(os.listdir(PARENT)) if d.startswith("app-catalog") and os.path.isfile(os.path.join(PARENT, d, "catalog", "server.mjs"))]
-guess = os.path.join(PARENT, "app-catalog-main") if "app-catalog-main" in _cands else (os.path.join(PARENT, _cands[0]) if _cands else "")
+# Prefer the folder named exactly app-ception-main, then app-catalog-main (an old copy renamed aside must not
+# win), else the first sibling folder that has catalog/server.mjs.
+_cands = [d for d in sorted(os.listdir(PARENT)) if os.path.isfile(os.path.join(PARENT, d, "catalog", "server.mjs"))]
+_pick = next((d for d in ("app-ception-main", "app-catalog-main") if d in _cands), _cands[0] if _cands else "")
+guess = os.path.join(PARENT, _pick) if _pick else ""
 
 dbutils.widgets.dropdown("mode", "child", ["child", "standalone"], "1. Mode")
-dbutils.widgets.text("catalog_folder", guess, "2. (child) App Catalog folder")
-dbutils.widgets.text("catalog_app_name", "app-catalog", "3. (child) App Catalog app name")
+dbutils.widgets.text("catalog_folder", guess, "2. (child) App-ception folder")
+dbutils.widgets.text("catalog_app_name", "app-ception", "3. (child) App-ception app name")
 dbutils.widgets.text("standalone_app_name", "lakemeter", "4. (standalone) App name")
 dbutils.widgets.text("snapshot_volume", "", "5. Snapshot volume <catalog>.<schema>.<volume>")
 dbutils.widgets.text("budget_policy_id", "", "6. Budget policy id, if your workspace requires one")
@@ -207,9 +209,14 @@ if MODE == "child":
     CAT = dbutils.widgets.get("catalog_folder").strip().rstrip("/")
     CAT_APP = dbutils.widgets.get("catalog_app_name").strip()
     assert CAT and os.path.isfile(f"{CAT}/catalog/server.mjs"), \
-        f"catalog_folder must be the App Catalog folder (with catalog/server.mjs); got {CAT!r}. Import app-catalog-main.zip first."
+        f"catalog_folder must be the App-ception folder (with catalog/server.mjs); got {CAT!r}. Import app-ception-main.zip first."
     cat = get_app(CAT_APP)
-    assert cat is not None, f"the App Catalog app {CAT_APP!r} does not exist: deploy the App Catalog first (its DEPLOY notebook)"
+    if cat is None and CAT_APP == "app-ception":   # deployed before the rename: the app is still app-catalog
+        cat = get_app("app-catalog")
+        if cat is not None:
+            CAT_APP = "app-catalog"
+            print("no app named app-ception; using the existing app-catalog app")
+    assert cat is not None, f"the App-ception app {CAT_APP!r} does not exist: deploy App-ception first (its DEPLOY notebook)"
     dest = f"{CAT}/child_apps/{CHILD}"
     if os.path.exists(dest):   # keep the previous copy, OUTSIDE child_apps so it is not discovered as an app
         bak = f"{CAT}/.bak-child-{CHILD}-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -219,8 +226,8 @@ if MODE == "child":
                 break
             time.sleep(1)
         print("previous copy kept at", bak)
-    # Only what the catalog runs: catalog.yaml points it at backend/ (app_dir). The rest of the repo
-    # (frontend sources, tests, scripts) stays out of the catalog's deploy.
+    # Only what App-ception runs: catalog.yaml points it at backend/ (app_dir). The rest of the repo
+    # (frontend sources, tests, scripts) stays out of App-ception's deploy.
     os.makedirs(dest)
     for f in ("catalog.yaml", "README.md", "LICENSE.md", "NOTICE.md", "FORK_CHANGES.md"):
         shutil.copy2(f"{SRC}/{f}", f"{dest}/{f}")
@@ -230,23 +237,23 @@ if MODE == "child":
     assert n_dst == n_src, f"copied {n_dst} of {n_src} files into {dest}"
     print(f"copied {n_dst} files into {dest}")
 
-    # Persistence: the catalog resolves valueFrom "snapshot-volume" against the catalog app's own
+    # Persistence: App-ception resolves valueFrom "snapshot-volume" against the App-ception app's own
     # resources named "lakemeter--snapshot-volume" or "snapshot-volume". This notebook does not change the
-    # catalog app; it checks and tells you.
+    # App-ception app; it checks and tells you.
     vols = [r for r in (cat.get("resources") or []) if r.get("name") in (f"{CHILD}--{RESOURCE}", RESOURCE)
             and (r.get("uc_securable") or {}).get("securable_type") == "VOLUME"]
     if vols:
-        print("snapshot volume on the catalog app:", vols[0]["uc_securable"]["securable_full_name"],
+        print("snapshot volume on the App-ception app:", vols[0]["uc_securable"]["securable_full_name"],
               "(", vols[0]["uc_securable"].get("permission"), ")")
     else:
-        print("\n!! The catalog app has no snapshot volume, so Lakemeter will run but NOT keep estimates (red banner).")
+        print("\n!! The App-ception app has no snapshot volume, so Lakemeter will run but NOT keep estimates (red banner).")
         print(f"   Add it in the UI: Compute → Apps → {CAT_APP} → Edit → App resources → + Add resource → UC volume,")
         print(f"   volume {VOLUME or '<catalog>.<schema>.<volume>'}, permission Can read and write, key '{CHILD}--{RESOURCE}'.")
-        print("   Then Run all again (or redeploy the catalog).\n")
+        print("   Then Run all again (or redeploy App-ception).\n")
     a = deploy(CAT_APP, CAT)
     url = a.get("url")
-    print("\nCATALOG URL:", url)
-    print("THIS APP   :", f"{url}/apps/{CHILD}/")
+    print("\nAPP-CEPTION URL:", url)
+    print("THIS APP       :", f"{url}/apps/{CHILD}/")
     h = try_json(f"{url}/_catalog/api/health")
     if h is not None:
         mine = [c for c in h.get("children", []) if c["name"] == CHILD]

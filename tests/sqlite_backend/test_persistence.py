@@ -162,7 +162,7 @@ def test_failed_upload_is_reported(workdir):
     ("file:///tmp/x/lakemeter-data.db", "file:///tmp/x/lakemeter-data.db"),
 ])
 def test_snapshot_path_forms(monkeypatch, given, expected):
-    """An Apps volume resource injects /Volumes/<c>/<s>/<v>; the App Catalog injects
+    """An Apps volume resource injects /Volumes/<c>/<s>/<v>; App-ception injects
     the three-part name. Both must land on the same file."""
     sys.path.insert(0, str(BACKEND))
     import app.persistence as persistence

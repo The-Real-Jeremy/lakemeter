@@ -20,13 +20,15 @@ Two ways to install it; both use the `DEPLOY` notebook.
 2. On this GitHub page: **Code → Download ZIP** (`lakemeter-main.zip`).
 3. In Databricks: open **the same folder that holds `app-ception-main/`** → **⋮ → Import** → drop the `.zip`.
    It unzips into `lakemeter-main/` next to App-ception.
-4. Give the **App-ception app** the volume that keeps the estimates: Compute → Apps → the App-ception app → Edit →
-   App resources → **+ Add resource → UC volume**, permission **Can read and write**, key
+4. Create a UC volume for the estimates if you do not have one (Catalog → a schema → **Create → Volume**; the
+   picker below lists only existing volumes). Then give the **App-ception app** that volume: Compute → Apps →
+   the App-ception app → Edit → App resources → **+ Add resource → UC volume**, permission **Can read and write**, key
    **`lakemeter--snapshot-volume`**. (Without it the app runs but shows a red banner: estimates are not kept.)
 5. Open **`lakemeter-main/DEPLOY`**, attach **Serverless**, leave **mode = `child`** (`catalog_folder` is
    filled in for you), then **Run all**. It copies the app into App-ception's `child_apps/lakemeter/` and
    redeploys App-ception; it does not create or change any app. The last cell prints
    `<App-ception URL>/apps/lakemeter/` and checks the volume from step 4.
+   If you gave the App-ception app a name other than `app-ception`, set **`catalog_app_name`** to that name first.
 
 To update either way: first **rename or delete the old `lakemeter-main/` folder** (an import onto an
 existing folder is refused with `RESOURCE_ALREADY_EXISTS` and the old folder stays), then import the new ZIP and

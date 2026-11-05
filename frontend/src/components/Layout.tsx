@@ -502,7 +502,7 @@ export default function Layout() {
             : 'The last save to durable storage failed. '}
           {capitalise(persistence.restore === 'failed'
             ? persistence.restore_detail
-            : persistence.last_error)}
+            : (persistence.last_error || persistence.restore_detail))}
           {persistence.uploads_blocked
             ? '. Anything you change now is lost when the app restarts. Ask your workspace admin to check LAKEMETER_SNAPSHOT_PATH.'
             : '. It is retried on your next change.'}

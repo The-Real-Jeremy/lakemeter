@@ -9,7 +9,8 @@ Two ways to install it; both use the `DEPLOY` notebook.
 1. On this GitHub page: **Code → Download ZIP** (`lakemeter-main.zip`). No need to unzip it.
 2. In Databricks: **Workspace** → a folder (e.g. your home) → **⋮ → Import** → drop the `.zip` → **Import**.
    Databricks unzips it into `lakemeter-main/`.
-3. Open **`lakemeter-main/DEPLOY`**, attach **Serverless**, set **mode = `standalone`** and
+3. Open **`lakemeter-main/DEPLOY`**, attach **Serverless**, set **mode = `standalone`**, choose
+   **persistence** (see [Where the estimates are kept](#where-the-estimates-are-kept)) and set
    **snapshot_volume** to a UC volume for the estimates (`<catalog>.<schema>.<volume>`; it is created if
    missing), then **Run all**. If your workspace requires a budget policy, it picks the only one in use, or
    asks you to paste one into **budget_policy_id**.
@@ -20,15 +21,36 @@ Two ways to install it; both use the `DEPLOY` notebook.
 2. On this GitHub page: **Code → Download ZIP** (`lakemeter-main.zip`).
 3. In Databricks: open **the same folder that holds `app-ception-main/`** → **⋮ → Import** → drop the `.zip`.
    It unzips into `lakemeter-main/` next to App-ception.
-4. Create a UC volume for the estimates if you do not have one (Catalog → a schema → **Create → Volume**; the
-   picker below lists only existing volumes). Then give the **App-ception app** that volume: Compute → Apps →
-   the App-ception app → Edit → App resources → **+ Add resource → UC volume**, permission **Can read and write**, key
-   **`lakemeter--snapshot-volume`**. (Without it the app runs but shows a red banner: estimates are not kept.)
-5. Open **`lakemeter-main/DEPLOY`**, attach **Serverless**, leave **mode = `child`** (`catalog_folder` is
-   filled in for you), then **Run all**. It copies the app into App-ception's `child_apps/lakemeter/` and
-   redeploys App-ception; it does not create or change any app. The last cell prints
-   `<App-ception URL>/apps/lakemeter/` and checks the volume from step 4.
+4. Open **`lakemeter-main/DEPLOY`**, attach **Serverless**, leave **mode = `child`** (`catalog_folder` is
+   filled in for you), choose **persistence** and **snapshot_volume** (see
+   [Where the estimates are kept](#where-the-estimates-are-kept)), then **Run all**. It copies the app into
+   App-ception's `child_apps/lakemeter/` and redeploys App-ception; it does not create or change any app. The
+   last cell prints `<App-ception URL>/apps/lakemeter/`.
    If you gave the App-ception app a name other than `app-ception`, set **`catalog_app_name`** to that name first.
+5. With **persistence = `user_volume`** (the default): if `DEPLOY` says the App-ception app lacks the scope
+   `files`, **Run all** on `app-ception-main/DEPLOY` (it adds the scopes its children declare), then Run all
+   on `lakemeter-main/DEPLOY` again (`DEPLOY` creates the volume if it is missing). With **`app_volume`**: create
+   the volume first if needed (Catalog → a schema → **Create → Volume**; the resource picker lists only existing
+   volumes), then give the App-ception app that volume as a resource, permission **Can read and write**, key
+   **`lakemeter--snapshot-volume`**.
+
+### Where the estimates are kept
+
+The app works on a local SQLite file that is wiped on every restart or redeploy, so after every save it copies
+the estimates somewhere durable and loads them back. `DEPLOY`'s **persistence** widget chooses where, and whose
+identity does the copying:
+
+| persistence | where | identity | grants needed |
+| --- | --- | --- | --- |
+| **`user_volume`** (default) | `snapshot_volume` | the **signed-in user** (app user authorization, scope `files`) | every user: **READ VOLUME** and **WRITE VOLUME** on the volume (plus USE CATALOG / USE SCHEMA). Nothing for the app. |
+| `app_volume` | `snapshot_volume` | the app's service principal | the app: the volume as a resource, **Can read and write** |
+| `app_home` | the app service principal's own workspace home folder | the app's service principal | none |
+| `none` | nowhere: estimates are lost on restart (red banner) | | none |
+
+With `user_volume` each user is asked once to let the app use their identity. There is no user while the app
+starts, so the saved estimates load on the first visit after a start; until then changes are refused rather
+than risk being overwritten. A user without the grants sees a red banner saying so. For example:
+`GRANT READ VOLUME, WRITE VOLUME ON VOLUME main.lakemeter.snapshots TO \`account users\`;`
 
 To update either way: first **rename or delete the old `lakemeter-main/` folder** (an import onto an
 existing folder is refused with `RESOURCE_ALREADY_EXISTS` and the old folder stays), then import the new ZIP and
@@ -50,8 +72,8 @@ In child mode `DEPLOY` keeps the previous child copy as `.bak-child-lakemeter-<t
   The PL/pgSQL pricing functions are ported to Python and proved digit for digit against
   PostgreSQL 16. See [docs/SQLITE_BACKEND.md](docs/SQLITE_BACKEND.md) and
   [tests/backend_parity](tests/backend_parity/README.md).
-* **Estimates survive restarts.** After every save the user data is copied to a UC volume, and it
-  is restored on start. If the copy cannot be restored, the app refuses to overwrite it and shows a
+* **Estimates survive restarts.** After every save the user data is copied to a UC volume (as the
+  signed-in user, or as the app) or the app's home folder, and it is restored on start. If the copy cannot be restored, the app refuses to overwrite it and shows a
   red banner.
 * **Offline install.** `backend/requirements.txt` is `--no-index --find-links wheels`. The packages
   the Databricks Apps runtime does not pre-install (SQLAlchemy, pydantic-settings, XlsxWriter, the
@@ -85,6 +107,7 @@ The app needs no user-authorization (on-behalf-of) scopes. To use Lakebase inste
 | --- | --- | --- |
 | `DB_BACKEND` | `sqlite` | `sqlite`, or unset for PostgreSQL / Lakebase |
 | `SQLITE_PATH` | `/tmp/lakemeter/lakemeter.db` | Working copy (wiped on restart) |
+| `LAKEMETER_PERSISTENCE` | `app` | `app`, `user_volume`, `app_home` or `none` ([where the estimates are kept](#where-the-estimates-are-kept)); `DEPLOY` sets it |
 | `LAKEMETER_SNAPSHOT_PATH` | `valueFrom: snapshot-volume` | Volume root, a `/Volumes/...` or `/Workspace/...` file, or `catalog.schema.volume` |
 | `LAKEMETER_AI_ASSISTANT` | `auto` | `auto` (on only if the endpoint exists), `on` or `off` |
 | `CLAUDE_MODEL_ENDPOINT` | `databricks-claude-opus-4-6` | Serving endpoint the assistant uses |

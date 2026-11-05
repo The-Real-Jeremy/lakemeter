@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import text
 
 from app.config import settings, setup_logging, log_info
@@ -84,15 +84,28 @@ app.add_middleware(
 
 @app.middleware("http")
 async def snapshot_after_writes(request: Request, call_next):
-    """SQLite backend: upload a snapshot before answering any request that wrote."""
-    response = await call_next(request)
+    """SQLite backend: upload a snapshot before answering any request that wrote.
+
+    LAKEMETER_PERSISTENCE=user_volume reads and writes the snapshot with the signed-in
+    user's token; the first request that carries one loads the saved estimates, and
+    writes are refused until then so they cannot be overwritten by that load.
+    """
     from app.sqlite_backend import is_sqlite_backend
 
-    if is_sqlite_backend():
-        from starlette.concurrency import run_in_threadpool
-        from app.persistence import persistence
+    if not is_sqlite_backend():
+        return await call_next(request)
+    from starlette.concurrency import run_in_threadpool
+    from app.persistence import SAFE_METHODS, persistence
 
-        await run_in_threadpool(persistence.snapshot_if_dirty)
+    token = request.headers.get("x-forwarded-access-token") if persistence.as_user else None
+    if persistence.waiting_for_user:
+        await run_in_threadpool(persistence.restore_as_user, token)
+        if persistence.waiting_for_user and request.method not in SAFE_METHODS:
+            return JSONResponse(status_code=503, content={"detail": (
+                "Saved estimates are not loaded yet, so changes are refused to protect them. "
+                + (persistence.status.last_error or "No user token reached the app: is user authorization on?"))})
+    response = await call_next(request)
+    await run_in_threadpool(persistence.snapshot_if_dirty, token)
     return response
 
 

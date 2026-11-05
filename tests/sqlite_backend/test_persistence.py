@@ -28,7 +28,7 @@ def _free_port() -> int:
 
 
 class App:
-    def __init__(self, workdir: Path, snapshot: str | None, name: str):
+    def __init__(self, workdir: Path, snapshot: str | None, name: str, extra_env: dict | None = None):
         self.port = _free_port()
         env = {k: v for k, v in os.environ.items()
                if k not in ("DATABASE_URL", "LAKEMETER_SNAPSHOT_PATH")}
@@ -36,6 +36,7 @@ class App:
                    SQLITE_PATH=str(workdir / f"{name}-wiped-on-restart.db"))
         if snapshot is not None:
             env["LAKEMETER_SNAPSHOT_PATH"] = snapshot
+        env.update(extra_env or {})
         self.log = workdir / f"{name}.log"
         self.process = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
@@ -173,3 +174,120 @@ def test_snapshot_path_forms(monkeypatch, given, expected):
     monkeypatch.setattr(manager, "_watch_commits", lambda engine: None)
     manager.configure(engine=object())
     assert manager.status.snapshot_path == expected
+
+
+# ---------------------------------------------------------------------------
+# LAKEMETER_PERSISTENCE=user_volume and none
+# ---------------------------------------------------------------------------
+
+class _FakeFilesApi:
+    """The Files API for one volume: token "good" may read and write, anything else gets 403."""
+
+    def __init__(self):
+        import http.server
+        import threading
+
+        files, calls = {}, []
+        self.files, self.calls = files, calls
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _answer(self, code, body=b""):
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _allowed(self):
+                token = self.headers.get("Authorization", "")
+                calls.append((self.command, self.path.split("?")[0], token))
+                if token != "Bearer good":
+                    self._answer(403, b'{"error_code":"PERMISSION_DENIED"}')
+                    return False
+                return True
+
+            def do_GET(self):
+                if self._allowed():
+                    key = self.path.split("?")[0]
+                    self._answer(200, files[key]) if key in files else self._answer(404)
+
+            def do_PUT(self):
+                if self._allowed():
+                    body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                    if self.path.startswith("/api/2.0/fs/files"):
+                        files[self.path.split("?")[0]] = body
+                    self._answer(204)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+
+
+@pytest.fixture
+def files_api():
+    api = _FakeFilesApi()
+    yield api
+    api.close()
+
+
+def _user_env(files_api) -> dict:
+    return {"LAKEMETER_PERSISTENCE": "user_volume", "DATABRICKS_HOST": files_api.url,
+            "LAKEMETER_AI_ASSISTANT": "off", "DATABRICKS_CLIENT_ID": "", "DATABRICKS_CLIENT_SECRET": ""}
+
+
+def _as(token: str) -> dict:
+    return {**HEADERS, "X-Forwarded-Access-Token": token}
+
+
+def test_user_volume_saves_and_restores_with_the_users_token(workdir, files_api):
+    snapshot_key = "/api/2.0/fs/files/Volumes/main/lakemeter/snapshots/lakemeter-data.db"
+    first = App(workdir, "main.lakemeter.snapshots", "user-first", _user_env(files_api))
+    try:
+        status = first.persistence()
+        assert status["mode"] == "user_volume" and status["restore"] == "pending_user"
+        # No token yet: writes are refused, so a later load cannot overwrite them.
+        refused = first.client.post("/estimates/", json=dict(
+            estimate_name="x", cloud="aws", region="us-east-1", tier="PREMIUM"))
+        assert refused.status_code == 503, refused.text
+        # A user without the grant: still waiting, told why, writes still refused.
+        denied = first.client.post("/estimates/", headers=_as("bad"), json=dict(
+            estimate_name="x", cloud="aws", region="us-east-1", tier="PREMIUM"))
+        assert denied.status_code == 503 and "READ VOLUME and WRITE VOLUME" in denied.text
+        assert first.persistence()["restore"] == "pending_user"
+        # A user with the grant: loads (nothing yet), then the save goes up as that user.
+        first.client.headers.update(_as("good"))
+        estimate_id = _create_estimate(first, "saved as the user")
+        status = first.persistence()
+        assert status["restore"] == "no_snapshot" and status["healthy"], status
+        assert status["snapshots_written"] >= 2 and snapshot_key in files_api.files
+        assert all(token == "Bearer good" for method, path, token in files_api.calls
+                   if method == "PUT")
+    finally:
+        first.stop()
+
+    second = App(workdir, "main.lakemeter.snapshots", "user-second", _user_env(files_api))
+    try:
+        second.client.headers.update(_as("good"))
+        status = second.persistence()
+        assert status["restore"] == "restored" and status["restored_rows"]["estimates"] == 1
+        restored = second.client.get(f"/estimates/{estimate_id}")
+        assert restored.status_code == 200 and restored.json()["estimate_name"] == "saved as the user"
+    finally:
+        second.stop()
+
+
+def test_persistence_none_still_calculates_and_says_so(workdir):
+    app = App(workdir, None, "none", {"LAKEMETER_PERSISTENCE": "none"})
+    try:
+        status = app.persistence()
+        assert status["mode"] == "none" and not status["healthy"] and status["uploads_blocked"]
+        assert "LAKEMETER_PERSISTENCE=none" in status["restore_detail"]
+        estimate_id = _create_estimate(app, "kept until restart")
+        assert app.client.get(f"/estimates/{estimate_id}").status_code == 200
+    finally:
+        app.stop()

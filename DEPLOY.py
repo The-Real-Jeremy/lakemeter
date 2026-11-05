@@ -8,6 +8,13 @@
 # MAGIC   or changes the App-ception app; it tells you if that app still needs the snapshot volume.
 # MAGIC - **standalone**: deploy it as its own Databricks App, with a UC volume that keeps the estimates.
 # MAGIC
+# MAGIC **persistence** chooses where the estimates are kept and WHOSE identity writes them:
+# MAGIC - **user_volume** (the default): a UC volume, read and written as the SIGNED-IN USER (app user authorization,
+# MAGIC   scope `files`). Nothing is granted to the app. Every user needs READ VOLUME and WRITE VOLUME on the volume.
+# MAGIC - **app_volume**: a UC volume bound to the app, so the app's service principal writes it.
+# MAGIC - **app_home**: a file in the app service principal's own workspace home folder. Needs no grant at all.
+# MAGIC - **none**: nothing is kept; estimates are lost on every restart or redeploy (a red banner says so).
+# MAGIC
 # MAGIC Needs no CLI, pip or npm: only the Databricks SDK the notebook already has. The app installs offline from
 # MAGIC the wheels in `backend/wheels`.
 
@@ -42,10 +49,14 @@ dbutils.widgets.dropdown("mode", "child", ["child", "standalone"], "1. Mode")
 dbutils.widgets.text("catalog_folder", guess, "2. (child) App-ception folder")
 dbutils.widgets.text("catalog_app_name", "app-ception", "3. (child) App-ception app name")
 dbutils.widgets.text("standalone_app_name", "lakemeter", "4. (standalone) App name")
-dbutils.widgets.text("snapshot_volume", "", "5. Snapshot volume <catalog>.<schema>.<volume>")
-dbutils.widgets.text("budget_policy_id", "", "6. Budget policy id, if your workspace requires one")
+dbutils.widgets.dropdown("persistence", "user_volume", ["user_volume", "app_volume", "app_home", "none"], "5. Persistence")
+dbutils.widgets.text("snapshot_volume", "", "6. Snapshot volume <catalog>.<schema>.<volume> (user_volume, app_volume)")
+dbutils.widgets.text("budget_policy_id", "", "7. Budget policy id, if your workspace requires one")
 MODE = dbutils.widgets.get("mode")
+PERSIST = dbutils.widgets.get("persistence")
 VOLUME = dbutils.widgets.get("snapshot_volume").strip()
+USES_VOLUME = PERSIST in ("user_volume", "app_volume")
+USER_SCOPE = "files"                          # the Files API as the signed-in user
 CHILD = "lakemeter"
 APP_ROOT = os.path.join(SRC, "backend")      # what a standalone deploy ships
 RESOURCE = "snapshot-volume"                  # app.yaml: LAKEMETER_SNAPSHOT_PATH valueFrom snapshot-volume
@@ -54,6 +65,34 @@ assert os.path.isfile(os.path.join(APP_ROOT, "app.yaml")) and os.path.isdir(os.p
     f"{APP_ROOT} is missing app.yaml or wheels/: was the whole repo imported?"
 assert not VOLUME or re.fullmatch(r"[^.\s]+\.[^.\s]+\.[^.\s]+", VOLUME), \
     "snapshot_volume must be a three-part name: <catalog>.<schema>.<volume>"
+assert VOLUME or not USES_VOLUME or (MODE == "child" and PERSIST == "app_volume"), \
+    f"persistence = {PERSIST} needs snapshot_volume (<catalog>.<schema>.<volume>)"
+print("persistence:", PERSIST, "|", VOLUME or "(no volume)")
+
+def set_persistence(app_yaml):
+    """Write the persistence choice into a copy's app.yaml (the LAKEMETER_SNAPSHOT_PATH entry)."""
+    y = open(app_yaml).read()
+    block = re.search(r'(?m)^  - name: "LAKEMETER_PERSISTENCE"\n    value: "[^"]*"\n', y)
+    if block:   # an earlier run of this notebook
+        y = y.replace(block.group(0), "")
+    old = re.search(r'(?m)^  - name: "LAKEMETER_SNAPSHOT_PATH"\n    (?:valueFrom|value): "[^"]*"\n', y)
+    assert old, f"{app_yaml}: no LAKEMETER_SNAPSHOT_PATH entry"
+    new = f'  - name: "LAKEMETER_PERSISTENCE"\n    value: "{PERSIST.replace("app_volume", "app")}"\n'
+    if PERSIST == "app_volume":
+        new += '  - name: "LAKEMETER_SNAPSHOT_PATH"\n    valueFrom: "snapshot-volume"\n'
+    elif PERSIST == "user_volume":
+        new += f'  - name: "LAKEMETER_SNAPSHOT_PATH"\n    value: "{VOLUME}"\n'
+    else:       # app_home and none need no path; keep the entry so this notebook can switch back
+        new += '  - name: "LAKEMETER_SNAPSHOT_PATH"\n    value: ""\n'
+    open(app_yaml, "w").write(y.replace(old.group(0), new))
+
+def print_user_grants():
+    if PERSIST == "user_volume":
+        print(f"\nEvery user of the app needs, on {VOLUME} (run once, as its owner or an admin):")
+        print(f"  GRANT READ VOLUME, WRITE VOLUME ON VOLUME {VOLUME} TO `account users`;   -- or a smaller group")
+        print("  (plus USE CATALOG and USE SCHEMA on its catalog and schema)")
+        print("Each user is asked once to allow the app to use their identity for files. The saved estimates load")
+        print("on the first visit after each start; until then changes are refused (they would be overwritten).\n")
 
 # COMMAND ----------
 
@@ -118,8 +157,10 @@ def keep_policy(a, body):
             body[k] = v
     return body
 
-def create_app(name, description, resources, policy_id):
+def create_app(name, description, resources, policy_id, scopes=()):
     body = {"name": name, "description": description, "resources": resources}
+    if scopes:
+        body["user_api_scopes"] = sorted(scopes)
     if policy_id:
         body["budget_policy_id"] = policy_id
     try:
@@ -241,6 +282,8 @@ if MODE == "child":
             CAT_APP = "app-catalog"
             print("no app named app-ception; using the existing app-catalog app")
     assert cat is not None, f"the App-ception app {CAT_APP!r} does not exist: deploy App-ception first (its DEPLOY notebook)"
+    if PERSIST == "user_volume":
+        ensure_volume(VOLUME)
     dest = f"{CAT}/child_apps/{CHILD}"
     if os.path.exists(dest):   # keep the previous copy, OUTSIDE child_apps so it is not discovered as an app
         bak = f"{CAT}/.bak-child-{CHILD}-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -256,6 +299,10 @@ if MODE == "child":
     for f in ("catalog.yaml", "README.md", "LICENSE.md", "NOTICE.md", "FORK_CHANGES.md"):
         shutil.copy2(f"{SRC}/{f}", f"{dest}/{f}")
     shutil.copytree(APP_ROOT, f"{dest}/backend", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    set_persistence(f"{dest}/backend/app.yaml")
+    if PERSIST == "user_volume":   # App-ception's own DEPLOY adds each child's scopes to its app
+        with open(f"{dest}/catalog.yaml", "a") as f:
+            f.write(f"user_api_scopes:\n  - {USER_SCOPE}\n")
     n_src = 5 + sum(len([x for x in fs if not x.endswith(".pyc")]) for r, _, fs in os.walk(APP_ROOT) if "__pycache__" not in r)
     n_dst = sum(len(fs) for _, _, fs in os.walk(dest))
     assert n_dst == n_src, f"copied {n_dst} of {n_src} files into {dest}"
@@ -266,10 +313,19 @@ if MODE == "child":
     # App-ception app; it checks and tells you.
     vols = [r for r in (cat.get("resources") or []) if r.get("name") in (f"{CHILD}--{RESOURCE}", RESOURCE)
             and (r.get("uc_securable") or {}).get("securable_type") == "VOLUME"]
-    if vols:
+    scopes = set(cat.get("effective_user_api_scopes") or cat.get("user_api_scopes") or [])
+    if PERSIST == "user_volume" and USER_SCOPE not in scopes:
+        print(f"\n!! The App-ception app {CAT_APP!r} lacks the user-authorization scope '{USER_SCOPE}', so Lakemeter")
+        print("   cannot save as the user yet (red banner; changes are refused). Fix it ONE of two ways, then Run all again:")
+        print(f"   - Run all on {CAT}/DEPLOY (App-ception adds the scopes its children declare), or")
+        print(f"   - Compute → Apps → {CAT_APP} → Edit → User authorization → + Add scope → '{USER_SCOPE}' → Save.\n")
+    elif PERSIST == "user_volume":
+        print(f"App-ception app has the user scope '{USER_SCOPE}'")
+    print_user_grants()
+    if PERSIST == "app_volume" and vols:
         print("snapshot volume on the App-ception app:", vols[0]["uc_securable"]["securable_full_name"],
               "(", vols[0]["uc_securable"].get("permission"), ")")
-    else:
+    elif PERSIST == "app_volume":
         print("\n!! The App-ception app has no snapshot volume, so Lakemeter will run but NOT keep estimates (red banner).")
         print(f"   Add it in the UI: Compute → Apps → {CAT_APP} → Edit → App resources → + Add resource → UC volume,")
         print(f"   volume {VOLUME or '<catalog>.<schema>.<volume>'}, permission Can read and write, key '{CHILD}--{RESOURCE}'.")
@@ -289,25 +345,30 @@ if MODE == "child":
 else:
     NAME = dbutils.widgets.get("standalone_app_name").strip()
     assert NAME and NAME == NAME.lower() and NAME.replace("-", "").isalnum(), "app name: lowercase letters, digits and '-'"
-    assert VOLUME, "standalone mode needs snapshot_volume (<catalog>.<schema>.<volume>): it keeps the estimates"
-    ensure_volume(VOLUME)
+    if USES_VOLUME:
+        ensure_volume(VOLUME)
+    want_res = [volume_resource(VOLUME)] if PERSIST == "app_volume" else []
+    want_scopes = [USER_SCOPE] if PERSIST == "user_volume" else []
     a = get_app(NAME)
     if a is None:
         print(f"creating app {NAME} …")
-        create_app(NAME, "Lakemeter (SQLite): Databricks pricing calculator", [volume_resource(VOLUME)],
-                   dbutils.widgets.get("budget_policy_id").strip())
+        create_app(NAME, "Lakemeter (SQLite): Databricks pricing calculator", want_res,
+                   dbutils.widgets.get("budget_policy_id").strip(), want_scopes)
         a = wait_compute(NAME, {"ACTIVE", "STOPPED", "ERROR"})
-    resources = [r for r in (a.get("resources") or []) if r.get("name") != RESOURCE]
+    resources = [r for r in (a.get("resources") or []) if r.get("name") != RESOURCE] + want_res
+    scopes = sorted(set(a.get("user_api_scopes") or []) | set(want_scopes))
     current = next((r for r in (a.get("resources") or []) if r.get("name") == RESOURCE), None)
-    if (current or {}).get("uc_securable", {}).get("securable_full_name") != VOLUME:
+    res_ok = ((current or {}).get("uc_securable", {}).get("securable_full_name") == VOLUME) if want_res else current is None
+    if not res_ok or scopes != sorted(a.get("user_api_scopes") or []):
         a = wait_compute(NAME, {"ACTIVE", "STOPPED", "ERROR"})
         body = keep_policy(a, {"name": NAME, "description": a.get("description", ""),
-                               "user_api_scopes": a.get("user_api_scopes") or [],
-                               "resources": resources + [volume_resource(VOLUME)]})
+                               "user_api_scopes": scopes, "resources": resources})
         api.do("PATCH", f"/api/2.0/apps/{NAME}", body=body)
-        print(f"{NAME}: resource '{RESOURCE}' → {VOLUME}")
+        print(f"{NAME}: user scopes {scopes or '(none)'} | resources {[r['name'] for r in resources] or '(none)'}")
     else:
-        print(f"{NAME} already keeps its estimates in {VOLUME}")
+        print(f"{NAME} already has the scopes and resources persistence = {PERSIST} needs")
+    set_persistence(f"{APP_ROOT}/app.yaml")
+    print_user_grants()
     a = deploy(NAME, APP_ROOT)
     url = a.get("url")
     print("\nAPP URL:", url)

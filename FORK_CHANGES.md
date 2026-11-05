@@ -12,7 +12,7 @@ upstream source file starts with a line saying so. This file lists them all.
 | `README.md` | Fork sections (Install, deploy, prices, tests) first; the upstream README follows |
 | `backend/app/bootstrap/runner.py` | SQLite bootstrap; loads `backend/prices` on top of the bundled snapshot (both backends) |
 | `backend/app/database.py` | `DB_BACKEND=sqlite` engine |
-| `backend/app/main.py` | SQLite start-up, snapshot after every write, `/api/v1/system/features`, `/persistence`, `/prices` |
+| `backend/app/main.py` | SQLite start-up, snapshot after every write (as the signed-in user with `LAKEMETER_PERSISTENCE=user_volume`), `/api/v1/system/features`, `/persistence`, `/prices` |
 | `backend/app/models/*.py` (7 files) and `models/__init__.py` | Portable column types; PostgreSQL column semantics on SQLite |
 | `backend/app/routes/chat.py` | `503 AI_ASSISTANT_DISABLED` when no model serving endpoint is available |
 | `backend/app/routes/reference/vector_search.py` | `CAST(... AS BIGINT)` instead of `::bigint` |
